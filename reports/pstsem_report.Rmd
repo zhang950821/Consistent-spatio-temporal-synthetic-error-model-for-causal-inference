@@ -1,0 +1,28 @@
+---
+title: "Vary-Coefficient Spatial Temporal Synthetic Error Model"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, message = FALSE, warning = FALSE)
+source(file.path("R", "load_project.R"))
+pstsem_source_project(load_packages = TRUE)
+```
+
+## Project Smoke Check
+
+```{r}
+pstsem_check_packages(stop_on_missing = FALSE)
+empirical_data <- pstsem_load_empirical_data()
+length(empirical_data$state)
+dim(empirical_data$W)
+```
+
+## Legacy Chunk Manifest
+
+```{r}
+pstsem_chunk_manifest()
+```
+
+Run the full legacy workflows from `scripts/` when reproducing long empirical or
+simulation experiments.

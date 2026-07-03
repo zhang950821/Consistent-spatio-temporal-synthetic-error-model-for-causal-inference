@@ -1,0 +1,3778 @@
+---
+title: "Vary-coefficient spatial temporal causal model"
+author: "Yan"
+date: "2024/8/19"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+This is an R Markdown document. Markdown is a simple formatting syntax for authoring HTML, PDF, and MS Word documents. For more details on using R Markdown see <http://rmarkdown.rstudio.com>.
+
+When you click the **Knit** button a document will be generated that includes both content as well as the output of any embedded R code chunks within the document. You can embed an R code chunk like this:
+
+```{r cars}
+summary(cars)
+```
+
+## Including Plots
+
+You can also embed plots, for example:
+
+```{r pressure, echo=FALSE}
+plot(pressure)
+```
+
+Note that the `echo = FALSE` parameter was added to the code chunk to prevent printing of the R code that generated the plot.
+
+```{r library}
+library(haven)
+library(dplyr)
+library(forecast)
+library(tseries)
+library(FinTS)
+library(Synth)
+library(gsynth)
+library(tidyverse)
+library(glmnet)
+library(spacetime)
+library(xts)
+library(spdep)
+library(ggplot2)
+library(augsynth)
+library(naniar)
+#安装augsynth的时候不能直接Install.packages， 要使用devtools从github安装，并且需要r版本对应的rtools
+
+library(gstat)
+library(iterators)
+library(parallel)
+library(foreach)
+library(doParallel)
+#library(np)
+library(mgcv)
+library(MASS)
+library(varycoef)
+library(patchwork)
+library(Rcpp)
+library(gsynth)
+
+install.packages("spdep")
+library(spdep)
+```
+
+```{r functions}
+#计算距离的函数
+
+
+distance<-function(u1,u2){
+  distance=sqrt((u1$latitude-u2$latitude)^2+(u1$longitude-u2$longitude)^2)
+  return(distance)
+}
+
+
+#生成distance matrix函数
+distance_matrix_func<-function(m){
+  matrix<-matrix(NA,50,50)
+  for(i in c(1:50)){
+    for(j in c(1:50)){
+      matrix[i,j]<-distance(state_dataframe[i,],state_dataframe[j,])
+    }
+  }
+  return(matrix)
+}
+#写一个更general的update_dataframe
+#修改pred_data_mod 中的ysl以及kansas的ylag
+update_pred_dataframe1<-function(kansas_pred_last_step, y_lag_order=5, ysl_lag_order=5, current_row=72){
+for(s in state){
+  temp_df<-get(paste(s,'_pre_treat_data_mod', sep=''))
+  if(s=='Kansas'){
+    temp_df[current_row, 'y']<-kansas_pred_last_step
+    for(i in c(1:y_lag_order)){
+      if(current_row+i>nrow(temp_df)) break
+        
+      temp_df[current_row+i,paste('y_lag', i, sep = '')]<-kansas_pred_last_step
+    }
+  } else{
+    temp_mod_ysl_currentstep<-temp_df[current_row,'ysl']+(kansas_pred_last_step-Kansas_pre_treat_data[current_row,'y'])*W[16,s]
+    temp_df[current_row,'ysl']<-temp_mod_ysl_currentstep
+    for(j in c(1:ysl_lag_order)){
+      if(current_row+j>nrow(temp_df)) break
+      
+      temp_df[current_row+j,paste('ysl_lag',j, sep='')]<-temp_mod_ysl_currentstep
+    }
+  }
+  assign(paste(s,'_pre_treat_data_mod', sep=''),temp_df, envir = .GlobalEnv)
+}
+  return(temp_df)
+}
+
+
+#修改pred_data_mod 中的ysl以及kansas的ylag
+update_pred_dataframe<-function(kansas_pred_last_step, step){
+for(s in state){
+  temp_df<-get(paste(s,'_pred_data_mod', sep=''))
+  if(s=='Kansas'){
+    for(i in c(step:(step+4))){
+      temp_df[i,paste('y_lag', i-1, sep = '')]<-kansas_pred_last_step
+    }
+  } else{
+    temp_mod_ysl_currentstep<-temp_df[step-1,'ysl']+(kansas_pred_last_step-Kansas_pred_data[1,'y'])*W[16,s]
+    temp_df[step-1,'ysl']<-temp_mod_ysl_currentstep
+    for(j in c(step:(step+4))){
+      temp_df[j,paste('ysl_lag',j-1, sep='')]<-temp_mod_ysl_currentstep
+    }
+  }
+  assign(paste(s,'_pred_data_mod', sep=''),temp_df, envir = .GlobalEnv)
+}
+  return(temp_df)
+}
+
+#生成simulation数据-----------------------------------------------------------------------------------------
+simu_func<-function(seed_index, weight_matrix){
+
+#simulation
+set.seed(seed_index)
+#时间点数量
+n=300
+#空间点数量
+m=50
+#创建时间序列time point
+time_points <- seq(from = 1, by = 1, length.out = n)
+W<-weight_matrix
+
+
+
+#首先生成每个序列各自的covariates x的时间序列， 对于每个地区，文中假设了有四个自变量，下面生成所有地区的四个自变量
+sigma<-1
+for(i in c(1:m))
+  for (j in c(1:4)) {
+    term_phi<-get(paste('phi_', i, '_', j, sep = ''))
+    term_ar<-list(order=c(1,0,0), ar=term_phi)
+    term_x<-arima.sim(term_ar, n=n, sd=sigma)
+    assign(paste('x_', i, '_', j, sep = ''), term_x)
+  }
+
+
+#现在开始构建outcome y_{it}=k1*x_i_1+k2*x_i_2+k3*x_i_3+k4*x_i_4+kc1*xc1+kc2*xc2+kc3*xc3+kl1*+y_{i,t-1}+...+epsilon_{it}
+
+for(i in c(1:m)){
+  assign(paste('y',i,sep=''), rep(0,n))
+  assign(paste('real_y',i,sep=''), rep(0,n))
+
+}
+
+
+temp_y<-get(paste('y',i,sep=''))
+temp_y[1]<-0
+assign(paste('y',i,sep=''), temp_y)
+
+
+for(i in c(1:m)){
+  assign(paste('ysl_',i, sep=''), rep(0,n))
+}
+
+#其实可以把beta的生成单独拿出来，然后只生成一次
+
+
+
+#这里t必须在外面
+for(t in c(6:n)){
+  for(i in c(1:m)){
+    temp_beta<-get(paste(state[i], "_coefficient", sep=''))
+    temp_ysl<-get(paste('ysl_',i, sep=''))
+    for(k in c(1:m)){
+      yk<-get(paste('y',k, sep=''))
+      temp_ysl[t-1]<-W[i,k]*yk[t-1]+temp_ysl[t-1]
+    }
+    
+    temp_x1<-get(paste('x_', i, '_1', sep=''))[t]
+    temp_x2<-get(paste('x_', i, '_2', sep=''))[t]
+    temp_x3<-get(paste('x_', i, '_3', sep=''))[t]
+    temp_x4<-get(paste('x_', i, '_4', sep=''))[t]
+    
+    temp_error<-rnorm(1,mean = 0, sd=0.1)
+    temp_y<-get(paste('y',i,sep=''))
+    temp_real_y<-get(paste('real_y',i,sep=''))
+    
+    
+    #现在还没有temp_ysl
+    temp_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_error
+
+    temp_real_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_error
+
+    
+    
+    # temp_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+    #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+    #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])+temp_error
+    # 
+    # temp_real_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+    #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+    #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])
+    
+    
+    assign(paste('y',i, sep=''), temp_y)
+    assign(paste('real_y',i, sep=''), temp_real_y)
+    assign(paste('ysl_',i, sep=''), temp_ysl)
+  }
+}
+
+
+#temp_ysl和temp_y用完之后得赋值还回来
+ts.plot(y1)
+par(mfrow=c(3,3))
+for(i in c(1:m)){
+  temp_series<-get(paste('y', i, sep=''))
+  ts.plot(temp_series)
+}
+
+
+#接下来要把数据整理成一个个表格，然后建模,每个里面有y, x, ysl
+
+for(i in c(1:m)){
+  temp_y<-get(paste('y', i, sep=''))
+  temp_unit<-temp_y
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep=''))))
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=2) )
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=3) )
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=4) )
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=5) )
+  
+  temp_unit<-cbind(temp_unit, get(paste('ysl_', i, sep='')))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep=''))))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=2))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=3))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=4))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=5))
+  
+  for(j in c(1:4)){
+    temp_unit<-cbind(temp_unit,get(paste('x_', i, '_', j, sep = '')) )
+  }
+  temp_unit<-as.data.frame(temp_unit)
+  names(temp_unit)<-c('y','y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'ysl', 'ysl_lag1', 'ysl_lag2', 'ysl_lag3', 'ysl_lag4', 'ysl_lag5', 'x1', 'x2', 'x3', 'x4')
+  temp_unit<-temp_unit[c(51:n),]
+  assign(paste('unit_', i, sep=''), temp_unit, envir = .GlobalEnv)
+}
+return(temp_unit)
+}
+#--------------------------------------------------------------------------------------------------------------------------------------
+
+
+#将series分成pre treatment 和post treatment.
+sep_series<-function(T0,i){
+
+  temp_unit<-get(paste("unit_",i, sep=''))
+  temp_unit_pre<-temp_unit[c(1:T0),]
+  temp_unit_post<-temp_unit[(T0+1),]
+  temp_unit_post_series<-temp_unit[c(T0+1:T0+20),]
+  return(list(temp_unit_pre=temp_unit_pre, temp_unit_post=temp_unit_post, temp_unit_post_series=temp_unit_post_series))
+  # assign(paste('unit_',i, '_pre', sep = ''), temp_unit_pre, envir = .GlobalEnv)
+  # assign(paste('unit_',i, '_post', sep = ''), temp_unit_post, envir = .GlobalEnv)
+  # assign(paste('unit_',i, '_post_series', sep = ''), temp_unit_post_series, envir = .GlobalEnv)
+
+}
+
+#residual matrix_NC
+gen_residual_matrix<-function(parameters){
+residual_matrix_NC<-NULL
+valid_residual_matrix_NC<-NULL
+
+for(s in state){
+print(state)
+  temp_data<-get(paste(s, "_training_data",sep = ""))
+  
+  temp_model<-lm(y~., data=temp_data[,c('y',parameters)])
+  temp_tstep<-step(temp_model)
+  assign(paste0(s, '_linear_model'), temp_tstep)
+  temp_residuals<-temp_tstep$residuals
+  residual_matrix_NC<-cbind(residual_matrix_NC,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  
+  assign(paste(s,"_residual", sep=""), temp_residuals)
+  temp_data_valid<-get(paste(s,'_validation_data', sep=''))
+  #计算模型在验证集中的预测误差
+  temp_valid_resid<-temp_data_valid[,4]-predict(temp_tstep,temp_data_valid[,c('y',parameters)])
+  assign(paste(s,'valid_resid', sep=''),temp_valid_resid)
+  valid_residual_matrix_NC<-cbind(valid_residual_matrix_NC, temp_valid_resid)
+}
+colnames(residual_matrix_NC)<-state
+colnames(valid_residual_matrix_NC)<-state
+result_list<-list(residual_matrix_NC, valid_residual_matrix_NC)
+return(result_list)
+}
+
+#kernel function
+K.gaussian <- function(u) {
+  return((1 / sqrt(2 * pi)) * exp(-0.5 * u^2))
+}
+
+L_2d.gaussian <- function(s) {
+  lon<-s[1]
+  lat<-s[2]
+  (1 / (2 * pi)) * exp(-0.5 * (lon^2 + lat^2))
+}
+
+
+```
+
+```{r data preparasion}
+kansas<-read.csv('data/kansas.csv', header = T)
+#原始kansas数据
+kansas_raw<-read.csv('data/kansas_raw.csv')
+location<-read.csv('data/us-state-capitals.csv')
+#step1:处理Kansas数据
+#step1.1: 将Kansas的state列中所有元素中的空格替换成下划
+#write.csv(kansas_raw, file = 'data/kansas_modname.csv')
+#提取state（其实在location提取就可以）
+state<-unique(location$name)
+#读取每个州的training数据
+for (s in state){
+    temp_data<-read.csv(paste('data/total_matrix/diff_using_60train_data/',s,'.csv', sep=''))
+  assign(paste(s,'_training_data', sep=''), temp_data)
+}
+#标准化协变量，得出training_mod数据
+for(s in state){
+  temp_data<-read.csv(paste('data/total_matrix/diff_using_60train_data/',s,'.csv', sep=''))
+    for(t in c(2:70)){
+  temp_data[t,'totalwagescapita_dif']<-(temp_data[t,'totalwagescapita'])/(temp_data[t-1,'totalwagescapita'])-1
+  
+  temp_data[t,'emplvlcapita_dif']<-(temp_data[t,'emplvlcapita'])/(temp_data[t-1,'emplvlcapita'])-1
+    
+    temp_data[t,'popestimate_dif']<-(temp_data[t,'popestimate'])/(temp_data[t-1,'popestimate'])-1
+      
+      temp_data[t,'qtrly_estabs_count_dif']<-(temp_data[t,'qtrly_estabs_count'])/(temp_data[t-1,'qtrly_estabs_count'])-1
+    }
+  temp_data<-temp_data[-1,]
+  assign(paste(s,'_training_data_mod', sep=''), temp_data)
+}
+
+
+
+#读取每个州的validation数据
+for (s in state){
+    temp_data<-read.csv(paste('data/total_matrix/all_diff_data/',s,'_matrix_pre_and_post_mod.csv', sep=''))
+    temp_data_valid<-temp_data[72:83,]
+  assign(paste(s,'_validation_data', sep=''), temp_data_valid)
+  # validation_outputpath<-paste('data/total_matrix/diff_valid_data/',s,'_validation_data.csv', sep='')
+  # write.csv(temp_data_valid,file = validation_outputpath)
+}
+
+#标准化协变量，得出validation_mod数据
+for(s in state){
+  temp_data<-get(paste0(s,'_validation_data'))
+  temp_training_data_last<-get(paste0(s,'_training_data'))
+  
+  temp_data[1,'totalwagescapita_dif']<-(temp_data[1,'totalwagescapita'])/(temp_training_data_last[70,'totalwagescapita'])-1
+  
+  temp_data[1,'emplvlcapita_dif']<-(temp_data[1,'emplvlcapita'])/(temp_training_data_last[70,'emplvlcapita'])-1
+    
+  temp_data[1,'popestimate_dif']<-(temp_data[1,'popestimate'])/(temp_training_data_last[70,'popestimate'])-1
+      
+  temp_data[1,'qtrly_estabs_count_dif']<-(temp_data[1,'qtrly_estabs_count'])/(temp_training_data_last[70,'qtrly_estabs_count'])-1
+  
+    for(t in c(2:12)){
+  temp_data[t,'totalwagescapita_dif']<-(temp_data[t,'totalwagescapita'])/(temp_data[t-1,'totalwagescapita'])-1
+  
+  temp_data[t,'emplvlcapita_dif']<-(temp_data[t,'emplvlcapita'])/(temp_data[t-1,'emplvlcapita'])-1
+    
+  temp_data[t,'popestimate_dif']<-(temp_data[t,'popestimate'])/(temp_data[t-1,'popestimate'])-1
+      
+  temp_data[t,'qtrly_estabs_count_dif']<-(temp_data[t,'qtrly_estabs_count'])/(temp_data[t-1,'qtrly_estabs_count'])-1
+    }
+  assign(paste(s,'_validation_data_mod', sep=''), temp_data)
+}
+
+#读取每个周的pre-treatment data
+for (s in state){
+   temp_data<-read.csv(paste('data/total_matrix/all_diff_data/',s,'_matrix_pre_and_post_mod.csv', sep=''))
+   assign(paste(s,'_pre_treat_data', sep=''), temp_data)
+   pre_treatment_outputpath<-paste('data/total_matrix/diff_using_60train_data/pre_treatment_data/',s,'_pre_treatment_data.csv', sep='')
+   #write.csv(temp_data, file=pre_treatment_outputpath)
+}
+
+#读取location数据并生成weight matrix
+  location<-read.csv('data/us-state-capitals.csv')
+#spatial weight vector
+state_dataframe<-NULL
+state_dataframe<-cbind(index=c(1:50),location)
+
+distance_matrix<-distance_matrix_func(state_dataframe)
+
+#inverse distance weight matrix
+W<-1/distance_matrix
+for(i in c(1:50)){
+  W[i,i]<-0
+}
+colnames(W)<-state
+
+
+```
+
+#-----------------------------------------------------------------------
+
+```{r vary-coefficient spatial temporal model}
+
+
+#变系数半参数模型
+Alabama_model<-gam(y~ s(totalwagescapita_dif, by=ysl)+s(totalwagescapita_dif, by=ysl_lag1)+s(totalwagescapita_dif, by=ysl_lag2)+s(totalwagescapita_dif, by=ysl_lag3), data=Alabama_training_data)
+
+
+
+Alabama_model<-gam(y~ s(ysl)+ysl_lag1+ysl_lag2+ysl_lag3+ysl_lag4+ysl_lag5+
+                       y_lag1+y_lag2+y_lag3+y_lag4+y_lag5+
+                       totalwagescapita_dif+emplvlcapita_dif+popestimate_dif+qtrly_estabs_count_dif
+                     ,data=Alabama_training_data, gradients=TRUE, coefplot=TRUE, regtype="ll", bwmethod="cv.aic", residuals=TRUE, ckertype="gaussian", errors=gaussian)
+
+```
+
+```{r kernel non-parametric model}
+#kernel非参数模型
+for (s in state){
+  temp_model<-npreg( y~ ysl+ysl_lag1+ysl_lag2+ysl_lag3+ysl_lag4+ysl_lag5+
+                       y_lag1+y_lag2+y_lag3+y_lag4+y_lag5+
+                       totalwagescapita_dif+emplvlcapita_dif+popestimate_dif+qtrly_estabs_count_dif
+                     ,data=get(paste(s,"_training_data", sep = '')), gradients=TRUE, coefplot=TRUE, regtype="ll", bwmethod="cv.aic", residuals=TRUE, ckertype="gaussian", errors=gaussian)
+  
+assign(paste(s,"_model", sep=''),temp_model)
+}
+
+
+```
+
+```{r extract residuals for kernel}
+for(s in state){
+  assign(paste(s,"_residual", sep=''),residuals(get(paste(s,"_model", sep=""))))
+}
+residual_matrix<-NULL
+
+for(s in state){
+  residual_matrix<-cbind(residual_matrix,get(paste(s,"_residual", sep="")))
+}
+
+colnames(residual_matrix)<-state
+cor(residual_matrix)
+
+count=0
+for(i in c(1:50)){
+  for(j in c(1:50)){
+    cor_result_temp<-cor.test(residual_matrix[,i], residual_matrix[,j])
+    if(cor_result_temp$p.value<=0.05&cor_result_temp$p.value!=0){
+          print(cor_result_temp$p.value)
+      count=count+1
+    }
+  }
+}
+#检测residual的时间自相关性
+par(mfrow=c(5,5))
+for(i in c(1:25)){
+  acf(residual_matrix[,i])
+}
+
+
+for(i in c(26:50)){
+  acf(residual_matrix[,i])
+}
+```
+
+```{r synthetic error: kernel--linear}
+
+#先用线性模型试一下
+var(Kansas_residual)
+linear_residual_model<-lm(Kansas_residual~., data=as.data.frame(residual_matrix))
+var(residuals(linear_residual_model))
+#将control units 的residual整理到一起
+control_group_residual<-NULL
+for(s in state){
+  if(s!="Kansas"){
+    control_group_residual<-cbind(control_group_residual,get(paste(s,"_residual",sep="")))
+  }
+}
+colnames(control_group_residual)<-state[-16]
+#使用lasso来拟合residual
+lambdas<-seq(0,1, length.out=1000)
+lasso_residual_model<-cv.glmnet(as.matrix(control_group_residual), as.matrix(Kansas_residual),  alpha=1, lambda = lambdas, nfolds=5)
+lasso_residual_model$cvm
+plot(lasso_residual_model)
+plot(lasso_residual_model$glmnet.fit, "lambda", label = T)
+best_lambda<-lasso_residual_model$lambda.min
+
+best_lasso_residual_model<-glmnet(as.matrix(control_group_residual), as.matrix(Kansas_residual),  alpha=1, lambda =best_lambda )
+coef(best_lasso_residual_model)
+
+lasso_pred<-predict(best_lasso_residual_model, s=best_lambda, newx=as.matrix(control_group_residual))
+lasso_model_residual<-as.matrix(Kansas_residual)-lasso_pred
+#在训练集上的MSE是
+MSE_training_synthetic_error_model<-sum(lasso_model_residual^2)/70
+#-------------------以上是模型的训练过程以及在训练集中模型的表现---------------
+#-------------------下面要看模型在验证集中的表现如何---------------------------
+validation_size<-12
+#首先对所有的地区验证集中的数据建模，并计算residual
+for(s in state){
+  temp_model1<-get(paste(s,'_model',sep=""))
+  temp_validatex<-get(paste(s,"_validation_data", sep=""))
+  temp_predict<-predict(temp_model1, newdata=temp_validatex)#这里预测出来应该是12个值啊，为什么是70个值？
+  temp_predict_residual<-get(paste(s,"_validation_data", sep=""))$y-temp_predict
+  assign(paste(s,"_validation_residual", sep=""), temp_predict_residual)
+}
+control_group_residual_validation<-NULL
+for(s in state){
+  if(s!="Kansas"){
+    control_group_residual_validation<-cbind(control_group_residual_validation,get(paste(s,"_validation_residual",sep="")))
+  }
+}
+
+colnames(control_group_residual_validation)<-state[-16]
+#synthetic residual
+synthetic_kansas_residual_validation<-predict(best_lasso_residual_model, s=best_lambda, newx=as.matrix(control_group_residual_validation))
+#接下来要算kansas synthetic error之后的residual
+predicted_Kansas_validation_stage1<-predict(Kansas_model,newdata=Kansas_validation_data)
+predicted_Kansas_validation_stage2<-predicted_Kansas_validation_stage1+synthetic_kansas_residual_validation
+#validation_MSE
+MSE_validation<-sum((Kansas_validation_data$y-predicted_Kansas_validation_stage2)^2)/validation_size
+#在验证集的MSE是22.50849
+#接下来可以考虑一下在synthetic error 的时候使用非参数带penalization的情形
+```
+
+#----------------------------------------------------------------------
+
+#------------------------LST synthetic error training and validation----------------------------------------------
+
+```{r  residual from LST}
+#------------generate residual matrix----
+residual_matrix<-NULL
+valid_residual_matrix<-NULL
+
+for(s in state){
+print(state)
+  temp_data<-get(paste(s, "_training_data",sep = ""))[,-1]
+
+  
+  temp_model<-lm(y~., data=temp_data[,-c(1,2,4,7:12)])
+  temp_tstep<-step(temp_model)
+  assign(paste0(s, '_linear_model'), temp_tstep)
+  temp_residuals<-temp_tstep$residuals
+  residual_matrix<-cbind(residual_matrix,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  
+  assign(paste(s,"_residual", sep=""), temp_residuals)
+  temp_data_valid<-get(paste(s,'_validation_data', sep=''))[,-1]
+  #计算模型在验证集中的预测误差
+  temp_valid_resid<-temp_data_valid[,3]-predict(temp_tstep,temp_data_valid[,-c(1,2,4,7:12)])
+  assign(paste(s,'valid_resid', sep=''),temp_valid_resid)
+  valid_residual_matrix<-cbind(valid_residual_matrix, temp_valid_resid)
+}
+colnames(residual_matrix)<-state
+colnames(valid_residual_matrix)<-state
+mean(residual_matrix[,16]^2)
+
+# residual_matrix1<-read.csv('data/total_matrix/diff_using_60train_data/residual_matrix.csv')[,-1]
+# mean(residual_matrix1[,16]^2)
+
+#------------generate no/selected covaraites residual_matrix_NC---------------------------
+residual_matrix_NC<-NULL
+valid_residual_matrix_NC<-NULL
+
+for(s in state){
+print(state)
+  temp_data<-get(paste(s, "_training_data",sep = ""))
+
+  
+  temp_model<-lm(y~., data=temp_data[,-c(1,2,3,5,8:17)])
+  temp_tstep<-step(temp_model)
+  assign(paste0(s, '_linear_model'), temp_tstep)
+  temp_residuals<-temp_tstep$residuals
+  residual_matrix_NC<-cbind(residual_matrix_NC,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  
+  assign(paste(s,"_residual", sep=""), temp_residuals)
+  temp_data_valid<-get(paste(s,'_validation_data', sep=''))
+  #计算模型在验证集中的预测误差
+  temp_valid_resid<-temp_data_valid[,4]-predict(temp_tstep,temp_data_valid[,-c(1,2,3,5,8:17)])
+  assign(paste(s,'valid_resid', sep=''),temp_valid_resid)
+  valid_residual_matrix_NC<-cbind(valid_residual_matrix_NC, temp_valid_resid)
+}
+colnames(residual_matrix_NC)<-state
+colnames(valid_residual_matrix_NC)<-state
+mean(residual_matrix_NC[,16]^2)
+```
+
+```{r least square synthetic error}
+
+linear_syn_model<-lm(Kansas~., data=as.data.frame(residual_matrix))
+summary(linear_syn_model)
+
+linear_syn_model_resid<-resid(linear_syn_model)
+#训练集MSE
+linear_syn_MSE_train<-mean(linear_syn_model_resid^2)
+#验证集MSE
+LSM_predictors_valid<-predict(linear_syn_model, newdata =control_valid_residual)
+
+linear_syn_MSE_valid<-mean((residual_matrix_valid[,16]-LSM_predictors_valid)^2)
+
+
+linear_syn_MSE_train
+linear_syn_MSE_valid#3.338
+```
+
+```{r lasso synthetic error}
+set.seed(150)
+lasso_SE_model<-glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), alpha=1)
+
+plot(lasso_SE_model, xvar="lambda")
+
+lasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, keep=TRUE)
+
+plot(lasso_SE_model_cv)
+
+best_lambda_lasso<-lasso_SE_model_cv$lambda.min
+
+best_lasso_coef<-coef(lasso_SE_model_cv, s=best_lambda_lasso)
+
+best_lasso_coef
+
+#查看训练集误差MSE
+lasso_predictors_train<-predict(lasso_SE_model, s=best_lambda_lasso, newx = as.matrix(residual_matrix[,-16]))
+
+lasso_MSE_train<-mean((residual_matrix[,16]-lasso_predictors_train)^2)
+
+lasso_MSE_train#0.05388
+
+#接下来在验证集误差MSE
+#这个是没标准化的residual_valid_matrix
+#residual_matrix_valid<-read.csv('data/total_matrix/diff_using_60train_data/pred_residual_matrix.csv')[,-1]
+#这个是上面直接得出的valid_residual_matrix
+residual_matrix_valid<-valid_residual_matrix
+control_valid_residual<-residual_matrix_valid[, -16]
+
+lasso_predictors_valid<-predict(lasso_SE_model, s=best_lambda_lasso, newx = as.matrix(control_valid_residual))
+
+lasso_MSE_valid<-mean((residual_matrix_valid[,16]-lasso_predictors_valid)^2)
+         
+
+lasso_MSE_train                        
+lasso_MSE_valid#1.94907
+
+```
+
+```{r adaptive lasso syntehtic error--validation part}
+#先做least square
+set.seed(150)
+SE_LM<-lm(Kansas~. , data = as.data.frame(residual_matrix))
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_model<-glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_model, xvar="lambda")
+
+alasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_model_cv)
+
+best_lambda<-alasso_SE_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_model_cv, s=best_lambda)
+
+best_alasso_coef
+
+#查看训练集误差MSE
+alasso_predictors_train<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(residual_matrix[,-16]))
+
+alasso_MSE_train<-mean((residual_matrix[,16]-alasso_predictors_train)^2)
+
+alasso_MSE_train#0.1909(seed=105)
+
+#接下来在验证集误差MSE
+#这个是没标准化的residual_valid_matrix
+residual_matrix_valid<-read.csv('data/total_matrix/diff_using_60train_data/pred_residual_matrix.csv')[,-1]
+write.csv(valid_residual_matrix, file='data/total_matrix/diff_using_60train_data/valid_residual_matrix.csv')
+#这个是上面直接得出的valid_residual_matrix
+#residual_matrix_valid<-valid_residual_matrix
+
+control_valid_residual<-valid_residual_matrix[, -16]
+
+alasso_predictors_valid<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(control_valid_residual))
+
+diff<-alasso_predictors_valid-valid_residual_matrix[,16]
+
+
+alasso_MSE_valid<-mean(diff^2)
+                                 
+alasso_MSE_valid#有时候1.448， 有时候0.885,都是seed=150 这个问题解决了，因为residual_matrix_valid有点问题，用valid_residual matrix就对了，就是0.88
+
+#LST的MSE_valid
+mean((valid_residual_matrix[,16])^2)
+
+#set.seed(101)表现很好
+alasso_MSE_train
+alasso_MSE_valid
+                    
+#--------------------写个循环看哪个seed好--
+
+MSE_seed_tab1<-data.frame(matrix(ncol = 3, nrow = 0))
+colnames(MSE_seed_tab1)<-c('seed', 'training_MSE', 'valid_MSE')
+temp_MSEs<-rep(0,3)
+
+
+for(seedindx in c(100:150)){
+  #先做least square
+set.seed(seedindx)
+SE_LM<-lm(Kansas~. , data = as.data.frame(residual_matrix))
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_model<-glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_model, xvar="lambda")
+
+alasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_model_cv)
+
+best_lambda<-alasso_SE_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_model_cv, s=best_lambda)
+
+best_alasso_coef
+
+#查看训练集误差MSE
+alasso_predictors_train<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(residual_matrix[,-16]))
+
+alasso_MSE_train<-mean((residual_matrix[,16]-alasso_predictors_train)^2)
+
+alasso_MSE_train#0.1909(seed=105)
+
+
+#接下来在验证集误差MSE
+#这个是没标准化的residual_valid_matrix
+residual_matrix_valid<-read.csv('data/total_matrix/diff_using_60train_data/pred_residual_matrix.csv')[,-1]
+#这个是上面直接得出的valid_residual_matrix
+#residual_matrix_valid<-valid_residual_matrix
+control_valid_residual<-valid_residual_matrix[, -16]
+
+alasso_predictors_valid<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(control_valid_residual))
+
+diff<-alasso_predictors_valid-valid_residual_matrix[,16]
+
+
+alasso_MSE_valid<-mean(diff^2)
+                                 
+alasso_MSE_valid#0.8850447
+temp_MSEs<-c(seedindx, alasso_MSE_train, alasso_MSE_valid)
+MSE_seed_tab1<-rbind(MSE_seed_tab1, temp_MSEs)
+}
+#write.csv(MSE_seed_tab1, file='data/empirical_training_valid_MSE_seed_table.csv')
+```
+
+#-------------------------------------------------------------------------
+
+#-------------------------LST synthetic error empirical------------------------------------------------------
+
+```{r empirical results by adaptive LASSO--prediction part}
+#Spatial temporal linear model for each location
+pre_and_post_residual_matrix<-NULL
+pre_and_post_pred_residual_matrix<-NULL
+for(s in state){
+  temp_data<-get(paste(s, "_pre_treat_data",sep = ""))[,-1]
+
+  temp_data_pred<-read.csv(paste("data/total_matrix/diff_using_60train_data/",s,"_post.csv", sep = ""))[,-1]
+  
+  temp_model<-lm(y~., data=temp_data[,-c(1,2,4, 7:12)])
+  temp_tstep<-step(temp_model)
+  temp_residuals<-temp_tstep$residuals
+  pre_and_post_residual_matrix<-cbind(pre_and_post_residual_matrix,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  
+  assign(paste(s,"_total_residual", sep=""),temp_residuals)
+  assign(paste(s,"_matrix_pre_and_post_mod", sep=""),temp_data)
+  assign(paste(s,"_pred_data", sep=""),temp_data_pred)
+  assign(paste(s,"_LST_model", sep=""), temp_tstep)
+
+  #计算模型在预测集中的预测误差
+  temp_pred_resid<-predict(temp_tstep,temp_data_pred[,-c(1,2,7:12)])-temp_data_pred[,3]
+  assign(paste(s,'real_pred_resid', sep=''),temp_pred_resid)
+  pre_and_post_pred_residual_matrix<-cbind(pre_and_post_pred_residual_matrix, temp_pred_resid)
+}
+colnames(pre_and_post_residual_matrix)<-state
+colnames(pre_and_post_pred_residual_matrix)<-state
+#-------------------------------------------------------------------------------------
+outpath<-'data/total_matrix/diff_using_60train_data/'
+write.csv(pre_and_post_residual_matrix, file=paste(outpath, 'pre_treatment_residual_matrix.csv', sep=""))
+write.csv(pre_and_post_pred_residual_matrix, file=paste(outpath, 'post_treatment_residual_matrix.csv', sep=""))
+
+#估计post-treatment的potential outcomes
+Kansas_temp<-Kansas_pre_treat_data[,-1]
+kansas_st_pred_model<-lm(y~., data=Kansas_temp[,-c(1,2,7:12)])
+kansas_st_pred_model_tstep<-step(kansas_st_pred_model)
+#基于LST进行预测
+Kansas_post<-read.csv("data/total_matrix/diff_using_60train_data/Kansas_post.csv")[,-1]
+LST_pred_Kansas<-predict(kansas_st_pred_model_tstep, Kansas_post[,-c(1,2, 7:12)])
+
+#开始adaptive lasso
+set.seed(150)
+SE_LM<-lm(Kansas~. , data = as.data.frame(pre_and_post_residual_matrix))
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_pred_model<-glmnet(x=as.matrix(pre_and_post_residual_matrix[,-16]), y=as.matrix(pre_and_post_residual_matrix[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_pred_model, xvar="lambda")
+
+
+
+alasso_SE_pred_model_cv<-cv.glmnet(x=as.matrix(pre_and_post_residual_matrix[,-16]), y=as.matrix(pre_and_post_residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_pred_model_cv)
+
+best_lambda<-alasso_SE_pred_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_pred_model_cv, s=best_lambda)
+
+best_alasso_coef
+#计算合成residual--adaptivelasso
+pred_residual<-predict(alasso_SE_pred_model, s=best_lambda, newx = as.matrix(pre_and_post_pred_residual_matrix[,-16]))
+#计算合成residual--LSE
+pred_residual_LST<-predict(SE_LM, newdata =as.data.frame(pre_and_post_pred_residual_matrix[,-16]) )
+
+#post_treatment数据中的延迟项要改，每预测一步就要改一次
+#第一步的预测是
+kansas_pred_step1<-LST_pred_Kansas[1]+pred_residual[1]
+
+#给一个pred_data_mod作为pred_data的副本
+for(s in state){
+  assign(paste(s,'_pred_data_mod', sep=''),get(paste(s,'_pred_data', sep='')))
+}
+
+update_pred_dataframe(kansas_pred_step1, 2)
+
+
+LST_pred_Kansas<-predict(kansas_st_pred_model_tstep, Kansas_post[,-c(1,2, 7:12)])
+
+#我这再初始化一遍以免以后整片跑代码的时候出错
+#给一个pred_data_mod作为pred_data的副本
+for(s in state){
+  assign(paste(s,'_pred_data_mod', sep=''),get(paste(s,'_pred_data', sep='')))
+}
+
+kansas_se_pred<-rep(0,16)
+kansas_LST_pred<-rep(0,16)
+kansas_LSE_se_pred<-rep(0,16)
+for(fstep in c(1:16)){
+  temp_LST_pred<-predict(kansas_st_pred_model_tstep, Kansas_pred_data_mod[,-c(1,2, 7:12)])
+  kansas_se_pred[fstep]<-temp_LST_pred[fstep]+pred_residual[fstep]
+  kansas_LST_pred[fstep]<-temp_LST_pred[fstep]
+  kansas_LSE_se_pred[fstep]<-temp_LST_pred[fstep]+pred_residual_LST[fstep]
+  update_pred_dataframe(kansas_se_pred[fstep], fstep+1)
+}
+
+Kansas_post[,3]
+
+#观测值
+Kansas_post[,3]
+obs_kansas_diff_post<-Kansas_post[,3]/100
+#synthetic error 结果
+kansas_se_pred
+#LST结果
+kansas_LST_pred
+#没有penalty的synthetic error 结果
+kansas_LSE_se_pred
+
+#将差分数据恢复成原始数据--- 观测值(记得要除100)
+last_pre_lngdpcapita<-kansas[1664,'lngdpcapita']
+post_obs_lngdpcapita<-rep(0,16)
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_obs_lngdpcapita[i]<-last_value+obs_kansas_diff_post[i]/100
+  last_value<-post_obs_lngdpcapita[i]
+}
+post_obs_lngdpcapita_series<-ts(post_obs_lngdpcapita,start = 90)
+
+
+
+
+
+#将差分数据恢复成原始数据--- adaptive lasso synthetic error model(一定要注意这个数据集里的数据乘100了，最后还原的时候要除回来)
+last_pre_lngdpcapita<-kansas[1664,'lngdpcapita']
+
+post_se_lngdpcapita<-rep(0,16)
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_se_lngdpcapita[i]<-last_value+kansas_se_pred[i]/100
+  last_value<-post_se_lngdpcapita[i]
+}
+post_se_lngdpcapita_series<-ts(post_se_lngdpcapita,start = 90)
+
+
+
+#将差分数据恢复成原始数据---LST(一定要注意这个数据集里的数据乘100了，最后还原的时候要除回来)
+post_LST_lngdpcapita<-rep(0,16)
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_LST_lngdpcapita[i]<-last_value+kansas_LST_pred[i]/100
+  last_value<-post_LST_lngdpcapita[i]
+}
+post_LST_lngdpcapita_series<-ts(post_LST_lngdpcapita,start = 90)
+
+
+
+#将差分数据恢复成原始数据---no penalty synthetic error(一定要注意这个数据集里的数据乘100了，最后还原的时候要除回来)
+post_LSE_se_lngdpcapita<-rep(0,16)
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_LSE_se_lngdpcapita[i]<-last_value+kansas_LSE_se_pred[i]/100
+  last_value<-post_LSE_se_lngdpcapita[i]
+}
+post_LSE_se_lngdpcapita_series<-ts(post_LSE_se_lngdpcapita,start = 90)
+
+
+
+obs_kansas_lngdpcapita<-kansas[kansas$state=='Kansas',]$lngdpcapita[60:105]
+
+obs_kansas_lngdpcapita<-ts(obs_kansas_lngdpcapita, start=60)
+
+
+#计算 causal effect adaptive lasso se
+post_obs_lngdpcapita<-kansas[kansas$state=='Kansas',]$lngdpcapita[90:105]
+
+
+causal_effect_alasso_se<-exp(post_obs_lngdpcapita)-exp(post_se_lngdpcapita_series)
+#1 step effect -1780.873
+#4 step mean effect
+mean(causal_effect_alasso_se[1:4])
+
+
+#计算 causal effect LST
+causal_effect_alasso_LST<-exp(post_obs_lngdpcapita)-exp(post_LST_lngdpcapita_series)
+#1 step effect -1780.873
+#4 step mean effect
+mean(causal_effect_alasso_LST[1:4])
+
+#计算causal effect no penalty se
+causal_effect_alasso_LSE_se<-exp(post_obs_lngdpcapita)-exp(post_LSE_se_lngdpcapita_series)
+#1 step effect -1985.278
+#4 step mean effect
+mean(causal_effect_alasso_LSE_se[1:4])
+
+
+
+
+
+#原始版本，现在写成函数update_pred_dataframe了
+# #修改pred_data_mod 中的ysl以及kansas的ylag
+# for(s in state){
+#   temp_df<-get(paste(s,'_pred_data', sep=''))
+#   if(s=='Kansas'){
+#     for(i in c(2:6)){
+#       temp_df[i,paste('y_lag', i-1, sep = '')]<-kansas_pred_step1
+#     }
+#   } else{
+#     temp_mod_ysl_step1<-temp_df[1,'ysl']+(kansas_pred_step1-Kansas_pred_data[1,'y'])*W[16,s]
+#     temp_df[1,'ysl']<-temp_mod_ysl_step1
+#     for(j in c(2:6)){
+#       temp_df[j,paste('ysl_lag',j-1, sep='')]<-temp_mod_ysl_step1
+#     }
+#   }
+#   assign(paste(s,'_pred_data_mod', sep=''),temp_df)
+# }
+
+```
+
+```{r synthetic control and ASCM}
+# #先把matrix_total_mod数据和在一个表里---------(这里会报错我先注释了)
+# diff_kansas_total<-NULL
+# temp_matrix_total<-NULL
+# for(s in state){
+#   temp_matrix_total<-get(paste(s,'_matrix_pre_and_pots', sep = ''))
+#   diff_kansas_total<-rbind(diff_kansas_total,temp_matrix_total)
+# }
+# 
+# diff_kansas_total$treated<-0
+# 
+# 
+# diff_kansas_total[diff_kansas_total$state=='Kansas'& diff_kansas_total$timepoint>89,'treated']<-1
+# diff_kansas_total$fips<-0
+# 
+# i=1
+# for(s in state){
+#   diff_kansas_total[diff_kansas_total$state==s,]$fips<-i
+#   i=i+1
+# }
+#write.csv(diff_kansas_total, file = 'data/diff_kansas_total.csv')
+
+
+#synthetic control ----------------------------------------------------------------------------------------------
+diff_kansas_total<-read.csv('data/diff_kansas_total.csv')[,-1]
+diff_kansas<-read.csv('data/diff_kansas.csv')[,-1]
+
+diff_kansas_total<-cbind(diff_kansas_total, abs(diff_kansas_total[,'y']))
+colnames(diff_kansas_total)[19]<-'yabs'
+
+diff_kansas<-cbind(diff_kansas, abs(diff_kansas[,'y']))
+colnames(diff_kansas)[19]<-'yabs'
+#这里用diff_kansas就是将t=78视作intervention time, 就是training vs validation.用diff_kansas_total就是将t=89视作intervention time, 就是pretreatment vs posttreatment 
+#对原始数据进行synthetic, predictor就是y本身
+#predictors中加yabs就是modified synthetic control,不加就是普通的
+dataprep.out<-dataprep(foo = diff_kansas_total,
+                       predictors = c('ysl','totalwagescapita_dif','emplvlcapita_dif','popestimate_dif', 'qtrly_estabs_count_dif'),
+                       predictors.op = 'mean',
+                       dependent = 'y',
+                       unit.variable = 'fips',
+                       time.variable = 'timepoint',
+                       treatment.identifier=16,
+                       special.predictors = NULL,
+                       controls.identifier = unique(diff_kansas$fips)[-16],
+                       time.predictors.prior = c(3:89),#need to be modified according to validation or predict
+                       time.optimize.ssr = c(3:89),
+                       unit.names.variable = 'state',
+                       time.plot = 3:105
+)
+
+synth.out<-synth(dataprep.out, output=TRUE)
+syn_weights<-synth.out$solution.w
+syn_weights<-syn_weights[,1]
+
+synth_kansas_post<-0
+
+control_states<-state[-16]
+
+for(i in c(1:49)){
+  temp_y<-get(paste(control_states[i],'_pred_data', sep=''))$y#如果是做validation就要换成_validation_data， 不然是pred_data
+  synth_kansas_post<-synth_kansas_post+temp_y*syn_weights[i]
+}
+
+SC_causal_effect<-Kansas_pred_data$y-synth_kansas_post#如果是做validation就要换成_validation_data, 不然是pred_data
+
+SC_MSE_valid<-mean(SC_causal_effect^2)
+#training MSE
+synth_kansas_train<-0
+
+for(i in c(1:49)){
+  temp_y<-get(paste(control_states[i],'_training_data', sep=''))$y#如果是做validation就要换成_validation_data
+  synth_kansas_train<-synth_kansas_train+temp_y*syn_weights[i]
+}
+SC_MSE_train<-mean((Kansas_training_data$y-synth_kansas_train)^2)
+
+
+#synth_kansas_post要转化回gdp数据
+post_SC_lngdpcapita<-0
+
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_SC_lngdpcapita[i]<-last_value+synth_kansas_post[i]/100
+  last_value<-post_SC_lngdpcapita[i]
+}
+
+
+
+post_SC_lngdpcapita<-ts(post_SC_lngdpcapita,start = 90)
+one_step_effect<-exp(kansas[1665,'lngdpcapita'])-exp(post_SC_lngdpcapita[1])
+four_step_effect<-0
+for(i in c(1:4)){
+  temp_step_effect<-exp(kansas[(1664+i),'lngdpcapita'])-exp(post_SC_lngdpcapita[i])
+  four_step_effect<-four_step_effect+temp_step_effect
+}
+four_step_ave_effect<-four_step_effect/4
+
+shorter_obs_kansas_lngdpcapita<-obs_kansas_lngdpcapita[11:46]
+
+
+
+
+
+#modified synthetic control ----------------------------------------------------------------------------------------------
+#predictors中加yabs就是modified synthetic control,不加就是普通的
+dataprep.out<-dataprep(foo = diff_kansas_total,
+                       predictors = c('ysl','totalwagescapita_dif','emplvlcapita_dif','popestimate_dif', 'qtrly_estabs_count_dif', 'yabs'),
+                       predictors.op = 'mean',
+                       dependent = 'y',
+                       unit.variable = 'fips',
+                       time.variable = 'timepoint',
+                       treatment.identifier=16,
+                       special.predictors = NULL,
+                       controls.identifier = unique(diff_kansas$fips)[-16],
+                       time.predictors.prior = c(3:89),#need to be modified according to validation or predict
+                       time.optimize.ssr = c(3:89),
+                       unit.names.variable = 'state',
+                       time.plot = 3:105
+)
+
+msynth.out<-synth(dataprep.out, output=TRUE)
+msyn_weights<-msynth.out$solution.w
+msyn_weights<-msyn_weights[,1]
+
+msynth_kansas_post<-0
+
+control_states<-state[-16]
+
+for(i in c(1:49)){
+  temp_y<-get(paste(control_states[i],'_pred_data', sep=''))$y#如果是做validation就要换成_validation_data， 不然是pred_data
+  msynth_kansas_post<-msynth_kansas_post+temp_y*msyn_weights[i]
+}
+
+mSC_causal_effect<-Kansas_pred_data$y-msynth_kansas_post#如果是做validation就要换成_validation_data, 不然是pred_data
+
+mSC_MSE_valid<-mean(mSC_causal_effect^2)
+#training MSE
+msynth_kansas_train<-0
+
+for(i in c(1:49)){
+  temp_y<-get(paste(control_states[i],'_training_data', sep=''))$y#如果是做validation就要换成_validation_data
+  msynth_kansas_train<-msynth_kansas_train+temp_y*syn_weights[i]
+}
+mSC_MSE_train<-mean((Kansas_training_data$y-msynth_kansas_train)^2)
+
+
+#synth_kansas_post要转化回gdp数据
+post_mSC_lngdpcapita<-0
+
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_mSC_lngdpcapita[i]<-last_value+msynth_kansas_post[i]/100
+  last_value<-post_mSC_lngdpcapita[i]
+}
+
+
+
+post_mSC_lngdpcapita<-ts(post_mSC_lngdpcapita,start = 90)
+mSC_one_step_effect<-exp(kansas[1665,'lngdpcapita'])-exp(post_mSC_lngdpcapita[1])
+mSC_four_step_effect<-0
+for(i in c(1:4)){
+  temp_step_effect<-exp(kansas[(1664+i),'lngdpcapita'])-exp(post_mSC_lngdpcapita[i])
+  mSC_four_step_effect<-mSC_four_step_effect+temp_step_effect
+}
+mSC_four_step_ave_effect<-mSC_four_step_effect/4
+
+shorter_obs_kansas_lngdpcapita<-obs_kansas_lngdpcapita[11:46]
+
+#ASCM-----------------------------------------------------------------
+#augsynth only time series
+asyn <- augsynth(y ~ treated|y+totalwagescapita_dif+emplvlcapita_dif+popestimate_dif+qtrly_estabs_count_dif, state, timepoint,diff_kansas_total,scm=T)#这里可以加ysl，就是ST-ASCM了
+summary(asyn)
+
+asyn_weight<-as.data.frame(asyn$weights)
+
+
+#合成valid  aug potential outcome
+augsyn_pot_outcom_post=rep(0,16)
+for(s in state){
+  if(s=='Kansas'){
+    next
+  }
+  temp_weight<-asyn_weight[s,]
+  temp_w_y<-get(paste(s,'_pred_data',sep=""))$y*temp_weight
+  augsyn_pot_outcom_post<-augsyn_pot_outcom_post+temp_w_y
+}
+
+#转化成gdp数据
+augsyn_pot_outcom_post
+
+post_ASCM_lngdpcapita<-0
+
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_ASCM_lngdpcapita[i]<-last_value+augsyn_pot_outcom_post[i]/100
+  last_value<-post_ASCM_lngdpcapita[i]
+}
+
+post_ASCM_lngdpcapita<-ts(post_ASCM_lngdpcapita,start = 90)
+
+#下面两个在下一块画图的时候再转为series并定义一个额外的series量
+post_SC_lngdpcapita<-as.numeric(post_SC_lngdpcapita)
+post_conventional_ASCM_lngdpcapita<-as.numeric(post_ASCM_lngdpcapita)
+
+#ST-ASCM--------------------------------------------------------------------------------
+#就在上面augsynth中加一个ysl就行了
+#augsynth only time series
+asyn <- augsynth(y ~ treated|y+ysl+totalwagescapita_dif+emplvlcapita_dif+popestimate_dif+qtrly_estabs_count_dif, state, timepoint,diff_kansas_total,scm=T)#这里可以加ysl，就是ST-ASCM了
+summary(asyn)
+
+asyn_weight<-as.data.frame(asyn$weights)
+
+
+#合成valid  aug potential outcome
+augsyn_pot_outcom_post=rep(0,16)
+for(s in state){
+  if(s=='Kansas'){
+    next
+  }
+  temp_weight<-asyn_weight[s,]
+  temp_w_y<-get(paste(s,'_pred_data',sep=""))$y*temp_weight
+  augsyn_pot_outcom_post<-augsyn_pot_outcom_post+temp_w_y
+}
+
+#转化成gdp数据
+augsyn_pot_outcom_post
+
+post_ASCM_lngdpcapita<-0
+
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_ASCM_lngdpcapita[i]<-last_value+augsyn_pot_outcom_post[i]/100
+  last_value<-post_ASCM_lngdpcapita[i]
+}
+
+post_ASCM_lngdpcapita<-ts(post_ASCM_lngdpcapita,start = 90)
+
+#下面两个在下一块画图的时候再转为series并定义一个额外的series量
+post_SC_lngdpcapita<-as.numeric(post_SC_lngdpcapita)
+post_ST_ASCM_lngdpcapita<-as.numeric(post_ASCM_lngdpcapita)
+
+#generalized synthetic control-----------------------标准化-----------
+diff_kansas_total_mod<-diff_kansas_total
+for(s in state){
+  for(t in c(2:103)){
+  diff_kansas_total_mod[diff_kansas_total_mod$state==s,][t,'totalwagescapita_dif']<-(diff_kansas_total[diff_kansas_total$state==s,][t,'totalwagescapita'])/(diff_kansas_total[diff_kansas_total$state==s,][t-1,'totalwagescapita'])-1
+  
+  diff_kansas_total_mod[diff_kansas_total_mod$state==s,][t,'emplvlcapita_dif']<-(diff_kansas_total[diff_kansas_total$state==s,][t,'emplvlcapita'])/(diff_kansas_total[diff_kansas_total$state==s,][t-1,'emplvlcapita'])-1
+    
+    diff_kansas_total_mod[diff_kansas_total_mod$state==s,][t,'popestimate_dif']<-(diff_kansas_total[diff_kansas_total$state==s,][t,'popestimate'])/(diff_kansas_total[diff_kansas_total$state==s,][t-1,'popestimate'])-1
+      
+      diff_kansas_total_mod[diff_kansas_total_mod$state==s,][t,'qtrly_estabs_count_dif']<-(diff_kansas_total[diff_kansas_total$state==s,][t,'qtrly_estabs_count'])/(diff_kansas_total[diff_kansas_total$state==s,][t-1,'qtrly_estabs_count'])-1
+  }
+}
+diff_kansas_total_mod<-diff_kansas_total_mod[diff_kansas_total_mod$timepoint!=3,]
+#给validation 创建一个dataset
+diff_kansas_total_mod_validation<-diff_kansas_total_mod
+diff_kansas_total_mod_validation[diff_kansas_total_mod_validation$timepoint>78 & diff_kansas_total_mod_validation$state=='Kansas','treated']<-1
+#gsynth validation
+gsynth_valid.out <- gsynth(y~treated+totalwagescapita_dif+emplvlcapita_dif+popestimate_dif+qtrly_estabs_count_dif, data = diff_kansas_total_mod_validation, index = c("state","timepoint"), nboots = 500, inference = "parametric", se = TRUE, parallel = TRUE)
+
+gsynth_valid.out$att
+
+gsynth_valid_effect_total<-gsynth_valid.out$att
+gsynth_valid_effect_pre<-gsynth_valid_effect_total[1:75]
+gsynth_valid_effect_post<-gsynth_valid_effect_total[76:86]
+
+gsynth_training_MSE<-mean(gsynth_valid_effect_pre^2)
+gsynth_valid_MSE<-mean(gsynth_valid_effect_post^2)
+
+
+  gap_plot<-plot(gsynth_valid.out, type = "gap" , xlab = "time_point", ylab="ATT")
+  #ggsave(paste0("D:/Lara/wildfires_social_vulnerability/results/", county,"_diff.png"))
+  
+  ### treated average and estimated counterfactual average outcomesraw = "none", main="",
+  plot(gsynth_valid.out, type = "counterfactual",  xlab = "time_point", ylab="y")
+
+
+#gsynth的第一项得写treatment indicator(gsynth prediction)
+gsynth.out <- gsynth(y~treated+totalwagescapita_dif+emplvlcapita_dif+popestimate_dif+qtrly_estabs_count_dif, data = diff_kansas_total_mod, index = c("state","timepoint"), nboots = 500, inference = "parametric", se = TRUE, parallel = TRUE)
+
+gsynth.out$att
+gsynth.out$Y.ct
+
+#转化成gdp数据
+gsynth_pot_outcom_post<-gsynth.out$Y.ct[87:102]
+
+post_gsynth_lngdpcapita<-0
+
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_gsynth_lngdpcapita[i]<-last_value+gsynth_pot_outcom_post[i]/100
+  last_value<-post_gsynth_lngdpcapita[i]
+}
+
+post_gsynth_lngdpcapita<-ts(post_gsynth_lngdpcapita,start = 90)
+
+
+
+gsynth_one_step_effect<-exp(kansas[1665,'lngdpcapita'])-exp(post_gsynth_lngdpcapita[1])
+gsynth_four_step_effect<-0
+for(i in c(1:4)){
+  temp_step_effect<-exp(kansas[(1664+i),'lngdpcapita'])-exp(post_gsynth_lngdpcapita[i])
+  gsynth_four_step_effect<-gsynth_four_step_effect+temp_step_effect
+}
+gsynth_four_step_ave_effect<-gsynth_four_step_effect/4
+
+
+#下面两个在下一块画图的时候再转为series并定义一个额外的series量
+post_SC_lngdpcapita<-as.numeric(post_SC_lngdpcapita)
+post_ASCM_lngdpcapita<-as.numeric(post_conventional_ASCM_lngdpcapita)
+post_ST_ASCM_lngdpcapita<-as.numeric(post_ST_ASCM_lngdpcapita)
+
+
+
+  gap_plot<-plot(gsynth.out, type = "gap" , xlab = "time_point", ylab="ATT")
+  #ggsave(paste0("D:/Lara/wildfires_social_vulnerability/results/", county,"_diff.png"))
+  
+  ### treated average and estimated counterfactual average outcomesraw = "none", main="",
+  plot(gsynth.out, type = "counterfactual",  xlab = "time_point", ylab="y")
+```
+
+```{r Robust synthetic control}
+#validation-------------------------
+#step1:
+X1_training<-Kansas_pre_treat_data[1:71,4]
+X1_validation<-Kansas_pre_treat_data[72:83,4]
+X0_training<-NULL
+X0_validation<-NULL
+for(s in control_states){
+  temp_pre_treat_data<-get(paste0(s,"_pre_treat_data"))
+  X0_training<-cbind(X0_training,temp_pre_treat_data[1:71,4])
+  X0_validation<-cbind(X0_validation,temp_pre_treat_data[72:83,4])
+}
+
+#singular decomposition
+X0_training_svd<-svd(X0_training)
+d<-X0_training_svd$d
+u<-X0_training_svd$u
+v<-X0_training_svd$v
+
+#set threshold mu
+mu=median(d)
+
+d_thres<-d
+for(i in c(1:49)){
+  if(d[i]<mu){
+    d_thres[i]<-0
+  }
+}
+d_mat<-diag(d)
+d_thres_mat<-diag(d_thres)
+
+X0_thres<-u%*%d_thres_mat%*%v
+
+#step2:
+robust_SC<-glmnet(x=X0_thres, y=X1_training, alpha = 0)
+
+
+robust_SC_cv<-cv.glmnet(x=X0_thres, y=X1_training, type.measure = "mse", nfold=10, alpha=0)
+
+plot(robust_SC_cv)
+
+best_lambda<-robust_SC_cv$lambda.min
+
+robust_SC_valid_pred<-predict(robust_SC, s=best_lambda, newx = X0_validation)
+
+robust_SC_train_pred<-predict(robust_SC, s=best_lambda, newx = X0_training)
+
+
+MSE_valid=mean((robust_SC_valid_pred-X1_validation)^2)
+
+MSE_training=mean((robust_SC_train_pred-X1_training)^2)
+
+for(mu in d){
+  d_thres<-d
+for(i in c(1:49)){
+  if(d[i]<mu){
+    d_thres[i]<-0
+  }
+}
+d_mat<-diag(d)
+d_thres_mat<-diag(d_thres)
+
+X0_thres<-u%*%d_thres_mat%*%v
+
+#step2:
+robust_SC<-glmnet(x=X0_thres, y=X1_training, alpha = 0)
+
+
+robust_SC_cv<-cv.glmnet(x=X0_thres, y=X1_training, type.measure = "mse", nfold=10, alpha=0)
+
+
+best_lambda<-robust_SC_cv$lambda.min
+
+robust_SC_valid_pred<-predict(robust_SC, s=best_lambda, newx = X0_validation)
+
+robust_SC_train_pred<-predict(robust_SC, s=best_lambda, newx = X0_training)
+
+
+MSE_valid=mean((robust_SC_valid_pred-X1_validation)^2)
+
+
+MSE_training=mean((robust_SC_train_pred-X1_training)^2)
+
+print(paste0('mu=', mu))
+
+print(paste0('MSE_training is: ', MSE_training))
+print(paste0('MSE_valid is: ', MSE_valid))
+}
+#best mu="mu=20.7241840884166"
+
+#实际预测部分--------------------------------------------------
+#step1:
+X1_training<-Kansas_pre_treat_data[,4]
+X1_validation<-Kansas_pred_data[,3]
+X0_training<-NULL
+X0_validation<-NULL
+for(s in control_states){
+  temp_pre_treat_data<-get(paste0(s,"_pre_treat_data"))
+  temp_post_data<-get(paste0(s,"_pred_data"))
+  X0_training<-cbind(X0_training,temp_pre_treat_data[,4])
+  X0_validation<-cbind(X0_validation,temp_post_data[,3])
+}
+
+#singular decomposition
+X0_training_svd<-svd(X0_training)
+d<-X0_training_svd$d
+u<-X0_training_svd$u
+v<-X0_training_svd$v
+
+#set threshold mu
+mu=median(d)
+
+for(mu in d){
+  d_thres<-d
+for(i in c(1:49)){
+  if(d[i]<mu){
+    d_thres[i]<-0
+  }
+}
+d_mat<-diag(d)
+d_thres_mat<-diag(d_thres)
+
+X0_thres<-u%*%d_thres_mat%*%v
+
+#step2:
+robust_SC<-glmnet(x=X0_thres, y=X1_training, alpha = 0)
+
+
+robust_SC_cv<-cv.glmnet(x=X0_thres, y=X1_training, type.measure = "mse", nfold=10, alpha=0)
+
+
+best_lambda<-robust_SC_cv$lambda.min
+
+robust_SC_valid_pred<-predict(robust_SC, s=best_lambda, newx = X0_validation)
+
+robust_SC_train_pred<-predict(robust_SC, s=best_lambda, newx = X0_training)
+
+
+
+MSE_training=mean((robust_SC_train_pred-X1_training)^2)
+
+print(paste0('mu=', mu))
+
+print(paste0('MSE_training is: ', MSE_training))
+
+}
+#mu=22.2557135018648的时候training MSE最小
+mu=22.2557135018648
+
+for(i in c(1:49)){
+  if(d[i]<mu){
+    d_thres[i]<-0
+  }
+}
+d_mat<-diag(d)
+d_thres_mat<-diag(d_thres)
+
+X0_thres<-u%*%d_thres_mat%*%v
+
+#step2:
+robust_SC<-glmnet(x=X0_thres, y=X1_training, alpha = 0)
+
+
+robust_SC_cv<-cv.glmnet(x=X0_thres, y=X1_training, type.measure = "mse", nfold=10, alpha=0)
+
+
+best_lambda<-robust_SC_cv$lambda.min
+
+robust_SC_pred<-predict(robust_SC, s=best_lambda, newx = X0_validation)
+
+#将预测的return值转化为gdp per capita
+post_RSC_lngdpcapita<-0
+
+last_value<-last_pre_lngdpcapita
+for(i in c(1:16)){
+  post_RSC_lngdpcapita[i]<-last_value+robust_SC_pred[i]/100
+  last_value<-post_RSC_lngdpcapita[i]
+}
+
+
+
+post_RSC_lngdpcapita<-ts(post_RSC_lngdpcapita,start = 90)
+#1 step and 4 step average effect
+one_step_effect<-exp(kansas[1665,'lngdpcapita'])-exp(post_RSC_lngdpcapita[1])
+four_step_effect<-0
+for(i in c(1:4)){
+  temp_step_effect<-exp(kansas[(1664+i),'lngdpcapita'])-exp(post_RSC_lngdpcapita[i])
+  four_step_effect<-four_step_effect+temp_step_effect
+}
+four_step_ave_effect<-four_step_effect/4
+
+
+```
+
+```{r plot}
+post_LST_lngdpcapita_series<-ts(post_LST_lngdpcapita, start=90)
+post_LST_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],as.numeric(post_LST_lngdpcapita_series)), start = 89)
+
+post_se_lngdpcapita_series_plt<-ts(c(obs_kansas_lngdpcapita[30],as.numeric(post_se_lngdpcapita_series)), start = 89)
+
+
+post_LSE_se_lngdpcapita_series_plt<-ts(c(obs_kansas_lngdpcapita[30],as.numeric(post_LSE_se_lngdpcapita_series)), start = 89)
+
+ts.plot(obs_kansas_lngdpcapita, post_LST_lngdpcapita_series, post_se_lngdpcapita_series_plt,post_LSE_se_lngdpcapita_series_plt,
+        col=c('black','red', 'blue', 'green'), ylab='Kansas ln(GDP) per capita')
+legend("topleft", legend = c("Observed data", "LST Model", "STPSEM", 'NPSTSEM'), col=c('black','red', 'blue', 'green'), lty=1)
+
+
+
+
+# ts.plot(obs_kansas_lngdpcapita,gpars=list(ylab='Kansas ln(GDP) per capita'))
+# lines(post_se_lngdpcapita_series, col='blue')
+
+#RSC
+post_RSC_lngdpcapita_series<-ts(post_RSC_lngdpcapita, start=90)
+post_RSC_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],post_RSC_lngdpcapita), start = 89)
+
+
+#mSC
+post_mSC_lngdpcapita_series<-ts(post_mSC_lngdpcapita, start=90)
+post_mSC_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],post_mSC_lngdpcapita), start = 89)
+
+#GSC
+post_gsynth_lngdpcapita_series<-ts(post_gsynth_lngdpcapita, start=90)
+post_gsynth_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],post_gsynth_lngdpcapita), start = 89)
+
+#PSTSEM vs SC
+post_SC_lngdpcapita_series<-ts(post_SC_lngdpcapita, start=90)
+post_SC_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],post_SC_lngdpcapita), start = 89)
+
+ts.plot(obs_kansas_lngdpcapita,post_SC_lngdpcapita_series, post_se_lngdpcapita_series_plt,
+        col=c('black','red','blue'), ylab='Kansas ln(GDP) per capita')
+legend("topleft", legend = c("Observed data", "Synthetic control", "STPSEM"), col=c('black','red','blue'), lty=1, cex = 0.5)
+
+
+#NPSTSEM vs ASCM
+post_ASCM_lngdpcapita_series<-ts(post_ASCM_lngdpcapita, start=90)
+post_ASCM_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],post_ASCM_lngdpcapita), start = 89)
+
+post_ST_ASCM_lngdpcapita_series<-ts(post_ST_ASCM_lngdpcapita, start=90)
+post_ST_ASCM_lngdpcapita_series<-ts(c(obs_kansas_lngdpcapita[30],post_ST_ASCM_lngdpcapita), start = 89)
+
+ts.plot(obs_kansas_lngdpcapita,post_ASCM_lngdpcapita_series, post_LSE_se_lngdpcapita_series_plt,
+        col=c('black','red','blue'), ylab='Kansas ln(GDP) per capita')
+legend("topleft", legend = c("Observed data", "ST-Augmented Synthetic Control", "NPSTSEM"), col=c('black','red','blue'), lty=1, cex = 0.5)
+
+#PSTSEM vs ASCM
+ts.plot(obs_kansas_lngdpcapita,post_ASCM_lngdpcapita_series, post_se_lngdpcapita_series_plt,
+        col=c('black','red','blue'), ylab='Kansas ln(GDP) per capita')
+legend("topleft", legend = c("Observed data", "ST-Augmented Synthetic Control", "STPSEM"), col=c('black','red','blue'), lty=1, cex = 0.5)
+
+```
+
+
+```{r ggplot}
+#SC vs MSC vs PSTSEM vs GSC-------------------------------------------
+# 时间点向量
+timepoints <- 60:105
+
+# 先确认长度
+n_total <- length(timepoints)  # 46
+n_pred <- length(post_SC_lngdpcapita_series)  # 17
+
+# 确定预测起点：timepoint = 89，是 timepoints 中的第 (89 - 60 + 1) = 30 个
+pred_start_index <- which(timepoints == 89)
+
+# 用 NA 补齐前面的值，使预测长度对齐为 46
+pad_na <- function(x, total_len, start_index) {
+  c(rep(NA, start_index - 1), x, rep(NA, total_len - length(x) - (start_index - 1)))
+}
+
+# 对 SC， mSC 和 PSTSEM 做 padding
+SC_full <- pad_na(post_SC_lngdpcapita_series, n_total, pred_start_index)
+mSC_full <- pad_na(post_mSC_lngdpcapita_series, n_total, pred_start_index)
+RSC_full <- pad_na(post_RSC_lngdpcapita_series, n_total, pred_start_index)
+PSTSEM_full <- pad_na(post_se_lngdpcapita_series_plt, n_total, pred_start_index)
+GSC_full<-pad_na(post_gsynth_lngdpcapita_series, n_total, pred_start_index)
+
+
+# 构造数据框
+df <- data.frame(
+  TimePoint = timepoints,
+  Observed = obs_kansas_lngdpcapita,
+  SC = SC_full,
+  STPSEM = PSTSEM_full,
+  MSC=mSC_full,
+  RSC=RSC_full,
+  GSC=GSC_full
+  
+)
+
+# 转为长格式
+df_long <- pivot_longer(df, cols = -TimePoint, names_to = "Model", values_to = "Value")
+
+# 画图
+ggplot(df_long, aes(x = TimePoint, y = Value, color = Model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("Observed" = "black", "SC" = "red", "STPSEM" = "blue", "MSC" = "brown", "RSC"="purple", "GSC"="orange")
+                     ) +
+  labs(y = "Kansas ln(GDP) per capita", x = "Time Point") +
+  theme_minimal() +
+  theme(legend.position = "top", legend.title = element_blank()) +
+  geom_vline(xintercept = 89, linetype = "dashed", color = "gray40") +
+  annotate("text", x = 89, y = max(df$Observed, na.rm = TRUE), label = "Intervention", vjust = -0.5, angle = 90, size = 3)
+# LST vs PSTSEM vs NPSTSEM-------------------------------------------
+# pad 各预测序列
+LST_full <- pad_na(post_LST_lngdpcapita_series, n_total, pred_start_index)
+PSTSEM_full <- pad_na(post_se_lngdpcapita_series_plt, n_total, pred_start_index)
+NPSTSEM_full <- pad_na(post_LSE_se_lngdpcapita_series_plt, n_total, pred_start_index)
+
+# 时间点向量
+timepoints <- 60:105
+
+df1 <- data.frame(
+  TimePoint = timepoints,
+  Observed = obs_kansas_lngdpcapita,
+  LST = LST_full,
+  STPSEM = PSTSEM_full,
+  STSEM = NPSTSEM_full
+)
+
+df1_long <- pivot_longer(df1, cols = -TimePoint, names_to = "Model", values_to = "Value")
+
+ggplot(df1_long, aes(x = TimePoint, y = Value, color = Model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("Observed" = "black", "LST" = "red", "STPSEM" = "blue", "STSEM" = "green")) +
+  labs( y = "Kansas ln(GDP) per capita", x = "Time Point") +
+  theme_minimal() +
+  theme(legend.position = "top", legend.title = element_blank()) +
+  geom_vline(xintercept = 89, linetype = "dashed", color = "gray40") +
+  annotate("text", x = 89, y = max(df1$Observed, na.rm = TRUE), label = "Intervention", angle = 90, vjust = -0.5, size = 3)
+
+
+#---------------------------ASCM vs PSTSEM----------or ST-ASCM vs PSTSEM----------------------------------
+ASCM_full <- pad_na(post_ASCM_lngdpcapita_series, n_total, pred_start_index)
+ST_ASCM_full <- pad_na(post_ST_ASCM_lngdpcapita_series, n_total, pred_start_index)
+
+
+PSTSEM_full <- pad_na(post_se_lngdpcapita_series_plt, n_total, pred_start_index)
+
+df4 <- data.frame(
+  TimePoint = timepoints,
+  Observed = obs_kansas_lngdpcapita,
+  ASCM = ASCM_full,
+  STPSEM = PSTSEM_full,
+  ST_ASCM=ST_ASCM_full
+)
+
+df4_long <- pivot_longer(df4, cols = -TimePoint, names_to = "Model", values_to = "Value")
+
+ggplot(df4_long, aes(x = TimePoint, y = Value, color = Model)) +
+  geom_line(size = 1) +
+  scale_color_manual(values = c("Observed" = "black", "ASCM" = "red", "STPSEM" = "blue", "ST_ASCM"="yellow")) +
+  labs( y = "Kansas ln(GDP) per capita", x = "Time Point") +
+  theme_minimal() +
+  theme(legend.position = "top", legend.title = element_blank()) +
+  geom_vline(xintercept = 89, linetype = "dashed", color = "gray40") +
+  annotate("text", x = 89, y = max(df4$Observed, na.rm = TRUE), label = "Intervention", angle = 90, vjust = -0.5, size = 3)
+
+
+```
+
+```{r interference test}
+ windows(width = 10, height =10)
+par(mfrow=c(5,5))
+for (i in 1:25) {
+  acf(pre_and_post_residual_matrix[,i])
+}
+```
+
+
+#-------------------------multi-step forward inference-------------------------------------------
+```{r multi-step-forward empirical experiment}
+#重复上面的，但是要改成逐步向前，不能直接用valid_residual_matrix中kansas的residual来算MSE了
+#先做least square
+#direct multi-forward(all four covariates)-------------
+
+state<-state_all
+set.seed(103)
+SE_LM<-lm(Kansas~. , data = as.data.frame(residual_matrix))
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_model<-glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_model, xvar="lambda")
+
+alasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_model_cv)
+
+best_lambda<-alasso_SE_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_model_cv, s=best_lambda)
+
+#查看训练集误差MSE
+alasso_predictors_train<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(residual_matrix[,-16]))
+#计算估计的potential outcome
+
+Kansas_step1_model<-lm(y~., data=Kansas_training_data[,-c(1,2,3,5,8:13)])
+Kansas_step1_model<-step(Kansas_step1_model)
+Kansas_step1_1forward_pred<-predict(Kansas_step1_model, newdata = Kansas_validation_data[1,-c(1,2,3,5,8:13)])
+Kansas_step2_1forward_pred<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix[1,-16])
+Kansas_1forward_pred<-Kansas_setp1_1forward_pred+Kansas_step2_1forward_pred
+Kansas_step1_forward_est_error<-Kansas_1forward_pred-Kansas_validation_data[1,'y']
+#现在开始进行多步向前更新
+#先备份一下pre_treat_data
+for(s in state){
+  assign(paste(s,'_pre_treat_data_mod', sep=''),get(paste(s,'_pre_treat_data', sep='')))
+}
+
+
+validation_length=16
+kansas_se_validation<-rep(0,validation_length)
+for(current_row in c(72:83)){
+ #browser()
+  temp_step1_Kansas_MF_pred<-predict(Kansas_step1_model, newdata = Kansas_pre_treat_data_mod[current_row,-c(1,2,3,5,8:13)])#这里和skip中的数据不一致
+  temp_pred_residual<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix[(current_row-71),-16])
+  temp_kansas_se_pred<-temp_step1_Kansas_MF_pred+temp_pred_residual
+   #browser()
+  update_pred_dataframe1(temp_kansas_se_pred, y_lag_order = 5, ysl_lag_order = 5, current_row = current_row)
+}
+
+for(s in state){
+  assign(paste(s,'_validation_data_mod', sep=''), get(paste(s,'_pre_treat_data_mod', sep=''))[72:83,])
+}
+
+STPSEM_valdiation_MF_error_Kansas<-Kansas_validation_data[,'y']-Kansas_validation_data_mod[,'y']
+
+MEE_validation_MF<-mean(STPSEM_valdiation_MF_error_Kansas[1:10]^2)
+MEE_validation_MF
+
+#-----------direct multi-step forward(selected covariates)----------------
+set.seed(100)
+
+covariates<-c( "emplvlcapita_dif", 'popestimate_dif', 'qtrly_estabs_count_dif')#"emplvlcapita_dif", 'totalwagescapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif'
+temp_lag_parameters<-c(
+      paste0("y_lag", (1:5)),
+      paste0("ysl_lag", (1:5))#emplvl记号
+    )
+    
+temp_parameters<-c(temp_lag_parameters, covariates)
+#residual_matrix from selected parameters是在这生成的
+residual_list<-gen_residual_matrix(temp_parameters)
+residual_matrix_NC<-residual_list[[1]]
+valid_residual_matrix_NC<-residual_list[[2]]
+
+
+#如果要排除covaraites就得把residual_matrix给换了
+SE_LM<-lm(Kansas~. , data = as.data.frame(residual_matrix_NC))
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_model<-glmnet(x=as.matrix(residual_matrix_NC[,-16]), y=as.matrix(residual_matrix_NC[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_model, xvar="lambda")
+
+alasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix_NC[,-16]), y=as.matrix(residual_matrix_NC[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_model_cv)
+
+best_lambda<-alasso_SE_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_model_cv, s=best_lambda)
+
+#查看训练集误差MSE
+alasso_predictors_train<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(residual_matrix_NC[,-16]))
+#计算估计的potential outcome
+
+Kansas_step1_model<-lm(y~., data=Kansas_training_data[,c('y', temp_parameters)])
+#Kansas_step1_model<-step(Kansas_step1_model)
+Kansas_step1_1forward_pred<-predict(Kansas_step1_model, newdata = Kansas_validation_data[1,temp_parameters])
+Kansas_step2_1forward_pred<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix_NC[1,-16])
+Kansas_1forward_pred<-Kansas_setp1_1forward_pred+Kansas_step2_1forward_pred
+Kansas_step1_forward_est_error<-Kansas_1forward_pred-Kansas_validation_data[1,'y']
+#现在开始进行多步向前更新
+#先备份一下pre_treat_data
+for(s in state){
+  assign(paste(s,'_pre_treat_data_mod', sep=''),get(paste(s,'_pre_treat_data', sep='')))
+}
+
+
+
+kansas_se_validation<-rep(0,16)
+for(current_row in c(72:83)){
+ #browser()
+  temp_step1_Kansas_MF_pred<-predict(Kansas_step1_model, newdata = Kansas_pre_treat_data_mod[current_row,temp_parameters])#这里和skip中的数据不一致
+  temp_pred_residual<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix_NC[(current_row-71),-16])
+  temp_kansas_se_pred<-temp_step1_Kansas_MF_pred+temp_pred_residual
+   #browser()
+  update_pred_dataframe1(temp_kansas_se_pred, y_lag_order = 5, ysl_lag_order = 5, current_row = current_row)
+}
+
+for(s in state){
+  assign(paste(s,'_validation_data_mod', sep=''), get(paste(s,'_pre_treat_data_mod', sep=''))[72:83,])
+}
+
+STPSEM_valdiation_MF_error_Kansas_NC<-Kansas_validation_data[,'y']-Kansas_validation_data_mod[,'y']
+
+MEE_validation_MF_NC<-mean(STPSEM_valdiation_MF_error_Kansas_NC[1:9]^2)
+MEE_validation_MF_NC
+#写个循环(包含所有covariates)----------------------
+MSE_table<-NULL
+for (seed_idx in c(100:120)){
+  set.seed(seed_idx)
+SE_LM<-lm(Kansas~. , data = as.data.frame(residual_matrix))
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_model<-glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_model, xvar="lambda")
+
+alasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix[,-16]), y=as.matrix(residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_model_cv)
+
+best_lambda<-alasso_SE_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_model_cv, s=best_lambda)
+
+#查看训练集误差MSE
+alasso_predictors_train<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(residual_matrix[,-16]))
+#计算估计的potential outcome
+
+Kansas_step1_model<-lm(y~., data=Kansas_training_data[,-c(1,2,3,5,8:13)])
+#Kansas_step1_model<-step(Kansas_step1_model)
+Kansas_step1_1forward_pred<-predict(Kansas_step1_model, newdata = Kansas_validation_data[1,-c(1,2,3,5,8:13)])
+Kansas_step2_1forward_pred<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix[1,-16])
+Kansas_1forward_pred<-Kansas_setp1_1forward_pred+Kansas_step2_1forward_pred
+Kansas_step1_forward_est_error<-Kansas_1forward_pred-Kansas_validation_data[1,'y']
+#现在开始进行多步向前更新
+#先备份一下pre_treat_data
+for(s in state){
+  assign(paste(s,'_pre_treat_data_mod', sep=''),get(paste(s,'_pre_treat_data', sep='')))
+}
+
+
+
+kansas_se_validation<-rep(0,16)
+for(current_row in c(72:83)){
+ #browser()
+  temp_step1_Kansas_MF_pred<-predict(Kansas_step1_model, newdata = Kansas_pre_treat_data_mod[current_row,-c(1,2,3,5,8:13)])#这里和skip中的数据不一致
+  temp_pred_residual<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix[(current_row-71),-16])
+  temp_kansas_se_pred<-temp_step1_Kansas_MF_pred+temp_pred_residual
+   #browser()
+  update_pred_dataframe1(temp_kansas_se_pred, y_lag_order = 5, ysl_lag_order = 5, current_row = current_row)
+}
+
+for(s in state){
+  assign(paste(s,'_validation_data_mod', sep=''), get(paste(s,'_pre_treat_data_mod', sep=''))[72:83,])
+}
+
+STPSEM_valdiation_MF_error_Kansas<-Kansas_validation_data[,'y']-Kansas_validation_data_mod[,'y']
+
+MSE_temp_row<-NULL
+for(ps in c(1:11)){
+  MEE_validation_MF<-mean(STPSEM_valdiation_MF_error_Kansas[ps:11]^2)
+  MSE_temp_row<-cbind(MSE_temp_row,MEE_validation_MF)
+  
+}
+MSE_table<-rbind(MSE_table,MSE_temp_row)
+colMeans(MSE_table)
+ts.plot(colMeans(MSE_table))
+# MEE_validation_MF<-mean(STPSEM_valdiation_MF_error_Kansas[11:12]^2)
+# MEE_validation_MF
+# MSE_table<-rbind(MSE_table,MEE_validation_MF)
+# print(paste('seed=', seed_idx, 'MSE=', MEE_validation_MF))
+}
+
+
+
+
+#写个循环（包含部分covariates）----------------
+covariates<-c("emplvlcapita_dif",  'popestimate_dif', 'qtrly_estabs_count_dif')#"emplvlcapita_dif", 'totalwagescapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif'
+temp_lag_parameters<-c(
+      paste0("y_lag", (1:5)),
+      paste0("ysl_lag", (1:5))#emplvl记号
+    )
+    
+temp_parameters<-c(temp_lag_parameters, covariates)
+
+#重新做一个residual_NC_matrix, 加入第15列emplvlcapita_diff的
+residual_matrix_NC<-NULL
+valid_residual_matrix_NC<-NULL
+
+for(s in state){
+print(state)
+  temp_data<-get(paste(s, "_training_data",sep = ""))
+
+  
+  temp_model<-lm(y~., data=temp_data[,c('y',temp_parameters)])
+  #temp_tstep<-temp_model
+  temp_tstep<-step(temp_model)
+  assign(paste0(s, '_linear_model'), temp_tstep)
+  temp_residuals<-temp_tstep$residuals
+  residual_matrix_NC<-cbind(residual_matrix_NC,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  
+  assign(paste(s,"_residual", sep=""), temp_residuals)
+  temp_data_valid<-get(paste(s,'_validation_data', sep=''))
+  #计算模型在验证集中的预测误差
+  temp_valid_resid<-temp_data_valid[,4]-predict(temp_tstep,temp_data_valid[,temp_parameters])
+  assign(paste(s,'valid_resid', sep=''),temp_valid_resid)
+  valid_residual_matrix_NC<-cbind(valid_residual_matrix_NC, temp_valid_resid)
+}
+colnames(residual_matrix_NC)<-state
+colnames(valid_residual_matrix_NC)<-state
+mean(residual_matrix_NC[,16]^2)
+
+
+
+
+MF_NC_MSE_table<-NULL
+for (seed_idx in c(100:120)){
+  set.seed(seed_idx)
+#如果要排除covaraites就得把residual_matrix给换了
+SE_LM<-lm(Kansas~. , data = as.data.frame(residual_matrix_NC))#对于不同的covariates选择这个resial_matrix也不一样，所以每次也要重新算一下
+lm_coef<-coef(SE_LM)[-1]
+alasso_SE_model<-glmnet(x=as.matrix(residual_matrix_NC[,-16]), y=as.matrix(residual_matrix_NC[,16]), alpha=1, penalty.factor = 1/abs(lm_coef))
+
+plot(alasso_SE_model, xvar="lambda")
+
+alasso_SE_model_cv<-cv.glmnet(x=as.matrix(residual_matrix_NC[,-16]), y=as.matrix(residual_matrix_NC[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef), keep=TRUE)
+
+plot(alasso_SE_model_cv)
+
+best_lambda<-alasso_SE_model_cv$lambda.min
+
+best_alasso_coef<-coef(alasso_SE_model_cv, s=best_lambda)
+
+#查看训练集误差MSE
+alasso_predictors_train<-predict(alasso_SE_model, s=best_lambda, newx = as.matrix(residual_matrix_NC[,-16]))
+#计算估计的potential outcome
+
+Kansas_step1_model<-lm(y~., data=Kansas_training_data[,c('y',temp_parameters)])
+#Kansas_step1_model<-step(Kansas_step1_model)
+Kansas_step1_1forward_pred<-predict(Kansas_step1_model, newdata = Kansas_validation_data[1,temp_parameters])
+Kansas_step2_1forward_pred<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix_NC[1,-16])
+Kansas_1forward_pred<-Kansas_setp1_1forward_pred+Kansas_step2_1forward_pred
+Kansas_step1_forward_est_error<-Kansas_1forward_pred-Kansas_validation_data[1,'y']
+#现在开始进行多步向前更新
+#先备份一下pre_treat_data
+for(s in state){
+  assign(paste(s,'_pre_treat_data_mod', sep=''),get(paste(s,'_pre_treat_data', sep='')))
+}
+
+
+
+kansas_se_validation<-rep(0,16)
+for(current_row in c(72:83)){
+ #browser()
+  temp_step1_Kansas_MF_pred<-predict(Kansas_step1_model, newdata = Kansas_pre_treat_data_mod[current_row,temp_parameters])#这里和skip中的数据不一致
+  temp_pred_residual<-predict(alasso_SE_model, s=best_lambda, newx = valid_residual_matrix_NC[(current_row-71),-16])
+  temp_kansas_se_pred<-temp_step1_Kansas_MF_pred+temp_pred_residual
+   #browser()
+  update_pred_dataframe1(temp_kansas_se_pred, y_lag_order = 5, ysl_lag_order = 5, current_row = current_row)
+}
+
+for(s in state){
+  assign(paste(s,'_validation_data_mod', sep=''), get(paste(s,'_pre_treat_data_mod', sep=''))[72:83,])
+}
+
+STPSEM_valdiation_MF_error_Kansas_NC<-Kansas_validation_data[,'y']-Kansas_validation_data_mod[,'y']
+
+MEE_validation_MF_NC<-mean(STPSEM_valdiation_MF_error_Kansas_NC[1:11]^2)
+MEE_validation_MF_NC
+MF_NC_MSE_table<-rbind(MF_NC_MSE_table, MEE_validation_MF_NC)
+}
+mean(MF_NC_MSE_table)
+var(MF_NC_MSE_table)
+
+```
+```{r spatial smooth skip-step-model empirical experiment}
+skip_lag_order<-5
+
+state<-state_all
+dyfast_spatial_est<-function(units,y, p, q, S, s, h2, parameters){
+  N=length(units)
+  T0=nrow(units[[1]])
+
+  #这个Y也许可以拿出来，在kfold之后用
+  Y<-NULL
+  for(i in c(1:N)){
+    Y<-matrix(c(Y,as.numeric(units[[i]][,y])), nrow=1)
+  }
+
+  Y<-t(Y)
+  param_length<-length(parameters)
+  
+  e1<-kronecker(c(1, 0, 0), diag(param_length+1))
+  
+  Wtuta_elements<-NULL
+  for(i in c(1:N)){
+    temp_L_kernel<-L_2d.gaussian((matrix(as.numeric(S[i,]), ncol=1)-s)/h2)/h2^2
+    rep_temp_L_kernel<-rep(temp_L_kernel, T0)
+    Wtuta_elements<-c(Wtuta_elements,rep_temp_L_kernel)
+  }
+  Wtuta<-diag(Wtuta_elements)
+  
+  
+  #browser()
+  Ztuta<-NULL
+  for(i in c(1:N)){
+    for(t in c(1:T0)){
+      Zt_temp<-c(1,matrix(as.numeric(units[[i]][t,parameters]), nrow=1))
+      Ztuta<-rbind(Ztuta, c(Zt_temp, kronecker((as.matrix((matrix(as.numeric(S[i,]), ncol=1)-s)/h2)), Zt_temp)))
+    }
+  }
+  
+  U=t(Ztuta)%*%Wtuta%*%Ztuta/(N*T0)
+  V=t(Ztuta)%*%Wtuta%*%Y/(N*T0)
+
+  #browser()
+  U_inv <- solve(U)
+  beta_hat<-t(e1)%*% U_inv%*%V#这里对于e1的kronecker product有疑问
+
+  return(beta_hat)
+}
+covariates<-c('emplvlcapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif')#"emplvlcapita_dif", 'totalwagescapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif'
+
+states_list<-list()
+for(i in c(1:50)){
+  states_list[[i]]<-get(paste0(state[i], '_training_data'))
+}
+
+# spatial_dyfast_Kansas_param<-dyfast_spatial_est(units=states_list,y='y', p=5, q=5,S=S, s=S[16,], h2=7, parameters=c('y_lag1','y_lag2','y_lag3','y_lag4','y_lag5', 'ysl_lag1', 'ysl_lag2','ysl_lag3','ysl_lag4','ysl_lag5'))
+
+# for(test_state in states_list){
+#   print(is.data.frame(test_state))
+# }
+
+fit_spatial_model_with_lags <- function(data_list, y_var, y_lag_range, ysl_lag_range, s_idx, covariates=NULL) {
+  # data: 原始数据
+  # y_var: 因变量列名
+  # y_lag_range, ysl_lag_range: 各自的 lag 范围，例如 1:5
+  
+  df_list <- data_list
+  
+  for(i in seq_along(df_list)){
+    df <- df_list[[i]]
+  
+  # 动态生成 y_lag
+  for (k in y_lag_range) {
+    if(k<=5){
+      next
+    }else{
+      df[[paste0("y_lag", k)]] <- dplyr::lag(df[[y_var]], k)
+    }
+  }
+  
+  # 动态生成 ysl_lag
+  for (k in ysl_lag_range) {
+        if(k<=5){
+      next
+    }else{
+    df[[paste0("ysl_lag", k)]] <- dplyr::lag(df[["ysl"]], k)
+    }
+  }
+  
+  df_list[[i]] <- na.omit(df)
+  }
+  #拟合公式字符串
+
+  temp_lag_parameters<-c(
+      paste0("y_lag", y_lag_range),
+      paste0("ysl_lag", ysl_lag_range)
+    )
+  temp_parameters<-c(temp_lag_parameters, covariates)
+
+  # spatial-modelling
+dyfast_Kansas_betas<-dyfast_spatial_est(units=df_list,y='y', p=length(y_lag_range), q=length(ysl_lag_range),S=S, s=S[s_idx,], h2=7, parameters=temp_parameters)
+
+  return(dyfast_Kansas_betas)
+}
+hawaii_idx<-which(state=='Florida')
+for(s_idx in c(1:(hawaii_idx-1), (hawaii_idx+1):50)){
+    for(forward_step in c(1:12)){
+    temp_spatial_beta<-fit_spatial_model_with_lags(data_list=states_list, y_var='y', y_lag_range = ((forward_step):(forward_step+skip_lag_order-1)), ((forward_step):(forward_step+skip_lag_order-1)), s_idx=s_idx, covariates=covariates)
+    assign(paste0(state[s_idx],'_forwardstep_',forward_step,'_spatial_beta'), temp_spatial_beta)
+    print(paste('s_idx:', s_idx, "forward_step:", forward_step))
+  }
+}
+
+
+#spatio-skip model predict-------------------
+#这一步好像加了covariates之后效果反而不好，还是因为数据长度原因，所以可能考虑和去掉covariates的multi-step forward 对比
+#我现在要加一个emelvlcapita
+set.seed(109)
+#先把temp_parameters设置好
+
+state_all<-state
+state<-state[-hawaii_idx]
+  
+for(forward_step in c(1:12)){
+  #spatial linear predict
+  for(s in state){
+    #validation data要有足够的lag，可能得用pre_treat_data来弄一下
+    temp_pre_treat_data<-get(paste0(s, '_pre_treat_data'))
+    for(j in c(6:(skip_lag_order+forward_step))){
+      temp_pre_treat_data[,paste0('y_lag', j)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], (j-5))
+      temp_pre_treat_data[,paste0('ysl_lag', j)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], (j-5))
+    }
+    # for(j in c(1:forward_step)){
+    #   temp_pre_treat_data[,paste0('y_lag', j+skip_lag_order-1)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], j)
+    #   temp_pre_treat_data[,paste0('ysl_lag', j+skip_lag_order-1)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], j)
+    # }
+    temp_validation_data<-temp_pre_treat_data[72:83,]
+    assign(paste0(s, '_skip_validation_data_step', forward_step),temp_validation_data)
+    
+
+    temp_spatial_beta<-get(paste0(s,'_forwardstep_',forward_step,'_spatial_beta'))
+    
+    temp_lag_parameters<-c(
+      paste0("y_lag", ((forward_step):(forward_step+skip_lag_order-1))),
+      paste0("ysl_lag", ((forward_step):(forward_step+skip_lag_order-1)))
+    )
+    
+    temp_parameters<-c(temp_lag_parameters, covariates)
+    
+    temp_spatial_step1_pred<-temp_spatial_beta[1]+as.matrix(temp_validation_data[forward_step,temp_parameters ])%*%as.matrix(temp_spatial_beta[-1,])
+
+    
+    assign(paste0(s,'_forwardstep',forward_step, '_spatial_step1_pred'), temp_spatial_step1_pred)
+  }
+  #extract residuals build synthetic weights and synthetic residuals
+  temp_skip_residual_matrix<-NULL
+  for(s in state){
+      temp_pre_treat_data<-get(paste0(s, '_pre_treat_data'))
+    for(j in c(6:(skip_lag_order+forward_step))){
+      temp_pre_treat_data[,paste0('y_lag', j)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], (j-5))
+      temp_pre_treat_data[,paste0('ysl_lag', j)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], (j-5))
+    }
+    temp_training_data<-temp_pre_treat_data[1:71,]
+    #browser()
+    #变系数模型的training residual不好搞
+    temp_spatial_beta<-get(paste0(s,'_forwardstep_',forward_step,'_spatial_beta'))
+    temp_lag_parameters<-c(
+      paste0("y_lag", ((forward_step):(forward_step+skip_lag_order-1))),
+      paste0("ysl_lag", ((forward_step):(forward_step+skip_lag_order-1)))
+    )
+    temp_parameters<-c(temp_lag_parameters, covariates)
+    
+    temp_est_training_data<-temp_spatial_beta[1]+as.matrix(temp_training_data[,temp_parameters ])%*%as.matrix(temp_spatial_beta[-1,])
+    temp_est_training_data<-na.omit(temp_est_training_data)#bug2
+    temp_training_residuals<-temp_training_data[(forward_step:71),'y']-temp_est_training_data
+    
+    temp_skip_residual_matrix<-cbind(temp_skip_residual_matrix,temp_training_residuals)
+  }
+  colnames(temp_skip_residual_matrix)<-state
+  assign(paste0('spatio_skip_residual_matrix_step',forward_step), temp_skip_residual_matrix)
+  mean((temp_skip_residual_matrix[,'Kansas'])^2)
+  #对所有forward_step对应的residual_matrix建立synthetic error model
+  #***这里还是存在参数量大但是数据量小的问题，先试一下，不行就用
+  # SE_ridge_skip<-glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]), alpha=0)
+  # SE_ridge_skip_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]),type.measure="mse", nfold=10, alpha=0)
+  # best_ridge_lambda<-SE_ridge_skip_cv$lambda.min
+  # lm_coef_skip<-coef(SE_ridge_skip, s=best_ridge_lambda)
+  # lm_coef_skip<-lm_coef_skip[-1,]
+  
+  
+  SE_LM_skip<-lm(Kansas~. , data = as.data.frame(temp_skip_residual_matrix))
+  lm_coef_skip<-coef(SE_LM_skip)[-1]
+  
+temp_alasso_skip_SE_model<-glmnet(x=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)!='Kansas']), y=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)=='Kansas']), alpha=1, penalty.factor = 1/abs(lm_coef_skip))
+
+temp_alasso_skip_SE_model_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)!='Kansas']), y=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)=='Kansas']),type.measure="mse", nfold=10, alpha=1, penalty.factor = 1/abs(lm_coef_skip), keep=TRUE)
+
+plot(temp_alasso_skip_SE_model_cv)
+#browser()
+temp_best_lambda_skip<-temp_alasso_skip_SE_model_cv$lambda.min
+coef(temp_alasso_skip_SE_model, s=temp_best_lambda_skip)
+
+#计算当前forwardstep的预测误差
+# for(s in state){
+#   get(paste0(s,'_step',forward_step, '_LM_pred'))
+# }
+#browser()
+skip_validation_errors<-NULL
+for(s in state){
+  temp_validation_data<-get(paste0(s, '_skip_validation_data_step', forward_step))
+  temp_spatial_step1_pred<-get(paste0(s,'_forwardstep',forward_step, '_spatial_step1_pred'))
+  temp_error<-temp_validation_data[forward_step,'y']-temp_spatial_step1_pred
+  skip_validation_errors<-cbind(skip_validation_errors, temp_error)
+}
+colnames(skip_validation_errors)<-state
+
+
+temp_skip_SE_error<-predict(temp_alasso_skip_SE_model_cv, s=temp_best_lambda_skip, newx = skip_validation_errors[,colnames(skip_validation_errors)!='Kansas'])
+
+temp_Kansas_spatial_step1_pred<-get(paste0('Kansas_forwardstep',forward_step, '_spatial_step1_pred'))
+temp_Kansas_spatial_skip_STPSEM_pred<-temp_Kansas_spatial_step1_pred+temp_skip_SE_error
+assign(paste0('Kansas_spatial_skip_forwardstep', forward_step, '_pred'), temp_Kansas_spatial_skip_STPSEM_pred)
+}
+
+Kansas_spatial_skip_validation_error<-NULL
+for(i in c(1:12)){
+  temp_Kansas_validation_error<-Kansas_validation_data[i,'y']-get(paste0('Kansas_spatial_skip_forwardstep', i, '_pred'))
+  Kansas_spatial_skip_validation_error<-c(Kansas_spatial_skip_validation_error,temp_Kansas_validation_error)
+}
+spatial_skip_validation_MSE<-mean(Kansas_spatial_skip_validation_error^2)
+spatial_skip_validation_MSE
+
+
+#写一个循环-------------------------------------------
+spatial_skip_MSE_table<-NULL
+spatial_skip_MSEs<-NULL
+for(seed_idx in c(100:120)){
+  set.seed(seed_idx)
+for(forward_step in c(1:12)){
+  #spatial linear predict
+  for(s in state){
+    temp_pre_treat_data<-get(paste0(s, '_pre_treat_data'))
+    for(j in c(6:(skip_lag_order+forward_step))){
+      temp_pre_treat_data[,paste0('y_lag', j)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], (j-5))
+      temp_pre_treat_data[,paste0('ysl_lag', j)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], (j-5))
+    }
+    # for(j in c(1:forward_step)){
+    #   temp_pre_treat_data[,paste0('y_lag', j+skip_lag_order-1)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], j)
+    #   temp_pre_treat_data[,paste0('ysl_lag', j+skip_lag_order-1)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], j)
+    # }
+    temp_validation_data<-temp_pre_treat_data[72:83,]
+    assign(paste0(s, '_skip_validation_data_step', forward_step),temp_validation_data)
+    
+
+    temp_spatial_beta<-get(paste0(s,'_forwardstep_',forward_step,'_spatial_beta'))
+    
+    temp_lag_parameters<-c(
+      paste0("y_lag", ((forward_step):(forward_step+skip_lag_order-1))),
+      paste0("ysl_lag", ((forward_step):(forward_step+skip_lag_order-1)))#emplvl记号
+    )
+    temp_parameters<-c(temp_lag_parameters, covariates)
+    
+    temp_spatial_step1_pred<-temp_spatial_beta[1]+as.matrix(temp_validation_data[forward_step,temp_parameters ])%*%as.matrix(temp_spatial_beta[-1,])
+
+    
+    assign(paste0(s,'_forwardstep',forward_step, '_spatial_step1_pred'), temp_spatial_step1_pred)
+  }
+  #extract residuals build synthetic weights and synthetic residuals
+  temp_skip_residual_matrix<-NULL
+  for(s in state){
+      temp_pre_treat_data<-get(paste0(s, '_pre_treat_data'))
+    for(j in c(6:(skip_lag_order+forward_step))){
+      temp_pre_treat_data[,paste0('y_lag', j)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], (j-5))
+      temp_pre_treat_data[,paste0('ysl_lag', j)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], (j-5))
+    }
+    temp_training_data<-temp_pre_treat_data[1:71,]
+    #browser()
+    #变系数模型的training residual不好搞
+    temp_spatial_beta<-get(paste0(s,'_forwardstep_',forward_step,'_spatial_beta'))
+    temp_lag_parameters<-c(
+      paste0("y_lag", ((forward_step):(forward_step+skip_lag_order-1))),
+      paste0("ysl_lag", ((forward_step):(forward_step+skip_lag_order-1)))
+    )
+    
+    temp_parameters<-c(temp_lag_parameters, covariates)
+    
+    temp_est_training_data<-temp_spatial_beta[1]+as.matrix(temp_training_data[,temp_parameters ])%*%as.matrix(temp_spatial_beta[-1,])
+    temp_est_training_data<-na.omit(temp_est_training_data)
+    temp_training_residuals<-temp_training_data[(forward_step:71),'y']-temp_est_training_data
+    
+    temp_skip_residual_matrix<-cbind(temp_skip_residual_matrix,temp_training_residuals)
+  }
+  colnames(temp_skip_residual_matrix)<-state
+  assign(paste0('spatio_skip_residual_matrix_step',forward_step), temp_skip_residual_matrix)
+  mean((temp_skip_residual_matrix[,'Kansas'])^2)
+  #对所有forward_step对应的residual_matrix建立synthetic error model
+  #***这里还是存在参数量大但是数据量小的问题，先试一下，不行就用
+  # SE_ridge_skip<-glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]), alpha=0)
+  # SE_ridge_skip_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]),type.measure="mse", nfold=10, alpha=0)
+  # best_ridge_lambda<-SE_ridge_skip_cv$lambda.min
+  # lm_coef_skip<-coef(SE_ridge_skip, s=best_ridge_lambda)
+  # lm_coef_skip<-lm_coef_skip[-1,]
+  
+  
+  SE_LM_skip<-lm(Kansas~. , data = as.data.frame(temp_skip_residual_matrix))
+  lm_coef_skip<-coef(SE_LM_skip)[-1]
+  
+temp_alasso_skip_SE_model<-glmnet(x=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)!='Kansas']), y=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)=='Kansas']), alpha=1, penalty.factor = 1/abs(lm_coef_skip))
+
+temp_alasso_skip_SE_model_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)!='Kansas']), y=as.matrix(temp_skip_residual_matrix[,colnames(temp_skip_residual_matrix)=='Kansas']),type.measure="mse", nfold=10, alpha=1, penalty.factor = 1/abs(lm_coef_skip), keep=TRUE)
+
+plot(temp_alasso_skip_SE_model_cv)
+#browser()
+temp_best_lambda_skip<-temp_alasso_skip_SE_model_cv$lambda.min
+coef(temp_alasso_skip_SE_model, s=temp_best_lambda_skip)
+
+#计算当前forwardstep的预测误差
+# for(s in state){
+#   get(paste0(s,'_step',forward_step, '_LM_pred'))
+# }
+#browser()
+skip_validation_errors<-NULL
+for(s in state){
+  temp_validation_data<-get(paste0(s, '_skip_validation_data_step', forward_step))
+  temp_spatial_step1_pred<-get(paste0(s,'_forwardstep',forward_step, '_spatial_step1_pred'))
+  temp_error<-temp_validation_data[forward_step,'y']-temp_spatial_step1_pred
+  skip_validation_errors<-cbind(skip_validation_errors, temp_error)
+}
+colnames(skip_validation_errors)<-state
+
+
+temp_skip_SE_error<-predict(temp_alasso_skip_SE_model_cv, s=temp_best_lambda_skip, newx = skip_validation_errors[,colnames(skip_validation_errors)!='Kansas'])
+
+temp_Kansas_spatial_step1_pred<-get(paste0('Kansas_forwardstep',forward_step, '_spatial_step1_pred'))
+temp_Kansas_spatial_skip_STPSEM_pred<-temp_Kansas_spatial_step1_pred+temp_skip_SE_error
+assign(paste0('Kansas_spatial_skip_forwardstep', forward_step, '_pred'), temp_Kansas_spatial_skip_STPSEM_pred)
+}
+
+Kansas_spatial_skip_validation_error<-NULL
+for(i in c(1:12)){
+  temp_Kansas_validation_error<-Kansas_validation_data[i,'y']-get(paste0('Kansas_spatial_skip_forwardstep', i, '_pred'))
+  Kansas_spatial_skip_validation_error<-c(Kansas_spatial_skip_validation_error,temp_Kansas_validation_error)
+}
+temp_spatial_skip_validation_MSE_row<-NULL
+for(ps in c(1:11)){
+  spatial_skip_validation_MSE<-mean(Kansas_spatial_skip_validation_error[ps:11]^2)
+  temp_spatial_skip_validation_MSE_row<-cbind(temp_spatial_skip_validation_MSE_row, spatial_skip_validation_MSE)
+}
+spatial_skip_MSE_table<-rbind(spatial_skip_MSE_table, temp_spatial_skip_validation_MSE_row)
+
+
+colMeans(MSE_table)
+ts.plot(colMeans(MSE_table))
+
+colMeans(spatial_skip_MSE_table)
+ts.plot(colMeans(spatial_skip_MSE_table))
+
+
+ts.plot(ts(colMeans(MSE_table)[1:11]),ts(colMeans(spatial_skip_MSE_table)[1:11]), col=c('black', 'red'))
+
+
+ spatial_skip_validation_MSE<-mean(Kansas_spatial_skip_validation_error[1:11]^2)
+ print(paste('seed=', seed_idx, 'MSE=', spatial_skip_validation_MSE))
+ spatial_skip_MSEs<-rbind(spatial_skip_MSEs, spatial_skip_validation_MSE)
+ 
+
+}
+
+
+
+#画图-------------------------------------
+# 数据
+mse_mf   <- colMeans(MSE_table)[1:11]
+mse_skip <- colMeans(spatial_skip_MSE_table)[1:11]
+
+horizon <- 1:11
+
+# 画图
+plot(
+  horizon, mse_mf,
+  type = "l",
+  lwd  = 2.5,
+  lty  = 1,                 # 实线
+  col  = "black",
+  xlab = "Validation Start Time",
+  ylab = "Validation Mean Squared Error (MSE)",
+  ylim = range(c(mse_mf, mse_skip)),
+  bty  = "l"                # 只保留左、下边框（论文常用）
+)
+
+lines(
+  horizon, mse_skip,
+  lwd = 2.5,
+  lty = 2,                  # 虚线
+  col = "red"
+)
+
+legend(
+  "topleft",
+  legend = c(
+    "Direct Multi-step Forward",
+    "Spatial-smooth Skip-step"
+  ),
+  col  = c("black", "red"),
+  lty  = c(1, 2),
+  lwd  = 2.5,
+  bty  = "n",
+  cex  = 0.9
+)
+#带置信区间的图
+# 假设：MSE_table 和 spatial_skip_MSE_table 的列对应 step/起点
+# 行对应 seed（或重复实验）
+idx <- 1:11
+horizon <- idx
+
+mf_mat   <- as.matrix(MSE_table)[, idx, drop = FALSE]
+skip_mat <- as.matrix(spatial_skip_MSE_table)[, idx, drop = FALSE]
+
+mf_mean   <- colMeans(mf_mat, na.rm = TRUE)
+skip_mean <- colMeans(skip_mat, na.rm = TRUE)
+
+mf_sd   <- apply(mf_mat,   2, sd, na.rm = TRUE)
+skip_sd <- apply(skip_mat, 2, sd, na.rm = TRUE)
+
+# 95% CI（正态近似；也可用分位数带）
+mf_lo <- mf_mean - 1.96 * mf_sd / sqrt(nrow(mf_mat))
+mf_hi <- mf_mean + 1.96 * mf_sd / sqrt(nrow(mf_mat))
+
+sk_lo <- skip_mean - 1.96 * skip_sd / sqrt(nrow(skip_mat))
+sk_hi <- skip_mean + 1.96 * skip_sd / sqrt(nrow(skip_mat))
+
+ylim <- range(c(mf_lo, mf_hi, sk_lo, sk_hi), na.rm = TRUE)
+
+plot(horizon, mf_mean, type="n",
+     xlab="Validation Start Time", ylab="Validation Mean Squared Error (MSE)",
+     ylim=ylim, bty="l")
+
+# 误差带（半透明多边形）
+polygon(c(horizon, rev(horizon)), c(mf_lo, rev(mf_hi)),
+        border = NA, col = adjustcolor("black", alpha.f = 0.15))
+polygon(c(horizon, rev(horizon)), c(sk_lo, rev(sk_hi)),
+        border = NA, col = adjustcolor("red", alpha.f = 0.15))
+
+# 均值线 + 点
+lines(horizon, mf_mean, col="black", lwd=2.5, lty=1)
+points(horizon, mf_mean, col="black", pch=16, cex=0.8)
+
+lines(horizon, skip_mean, col="red", lwd=2.5, lty=2)
+points(horizon, skip_mean, col="red", pch=17, cex=0.9)
+
+grid(nx = NA, ny = NULL, lty = 3, col = "grey85")
+
+legend("topleft",
+       legend = c("Recursive Multi-step-forward STPSEM (mean ± 95% CI)",
+                  "Spatial-smooth Skip-step-forward STPSEM (mean ± 95% CI)"),
+       col = c("black", "red"),
+       lty = c(1, 2),
+       pch = c(16, 17),
+       lwd = 2.5,
+       bty = "n",
+       cex = 0.9)
+
+
+
+mean(spatial_skip_MSEs[, 1])
+var(spatial_skip_MSEs[, 1])
+
+```
+#--------------------------simulation study--------------------------------------------
+
+```{r simulation study LSTSEM--data generating}
+
+
+m=50
+#生成covariates 的ar(1)系数 phi
+for(i in c(1:m)){
+  for(j in c(1:8)){
+    term_phi<-sin(j)*cos(location[i,'longitude']+location[i,'latitude'])/10
+    assign(paste('phi_', i, '_', j, sep = ''), term_phi)
+  }
+}
+
+#生成公共covariates ar系数
+for(i in c(1:4)){
+  temp_comm_phi<-0.5+0.2*sin(i)
+  assign(paste('comm_phi_', i, sep=''), temp_comm_phi)
+}
+
+#提取上述拟合模型中所有拟合系数beta
+#包含的参数有intercept, ysl_lag1,  ysl_lag2,  ysl_lag3,  ysl_lag4,  ysl_lag5, y_lag1, y_lag2, y_lag3, y_lag4, y_lag5, x_1t, x_2t, x_3t, x_4t
+#补充：要加上4个对kansas有显著影响的unobs_covariates，同时这些covariates对于其他的部分地区的outcome有显著影响
+#再次补充：再加上4个common covariates
+#所以目前一共23个变量
+parameter_list<-c('(Intercept)', 'ysl_lag1', 'ysl_lag2',  'ysl_lag3',  'ysl_lag4',  'ysl_lag5', 'y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'totalwagescapita_dif', 'emplvlcapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif')
+temp_beta<-rep(0,23)
+for(i in c(1:50)){
+  temp_s<-state[i]
+  temp_LST_model<-get(paste(temp_s, '_LST_model', sep=''))
+  temp_beta<-rep(0,23)
+  for(j in c(1:13)){
+    temp_param<-parameter_list[j]
+    temp_coef<-as.data.frame(coef(get(paste(temp_s, '_LST_model', sep=''))))
+    if(is.na(temp_coef[temp_param,1])){
+      temp_beta[j]<-0
+    } else{
+      temp_beta[j]<-temp_coef[temp_param,1]
+    }
+  }
+  # for(j in c(16,17)){
+  #   if(i<=30){
+  #     temp_beta[j]<-sin(i*j)
+  #   }
+  # }
+  
+  for(j in c(14:23)){
+        temp_beta[j]<-sin(i*j)*cos(i+j)
+    
+  }
+  assign(paste(temp_s, '_coefficient', sep=''),temp_beta)
+}
+
+
+
+
+simu_func<-function(seed_index, weight_matrix){
+
+#simulation
+set.seed(seed_index)
+#时间点数量
+n=300
+#空间点数量
+m=50
+#创建时间序列time point
+time_points <- seq(from = 1, by = 1, length.out = n)
+W<-weight_matrix
+
+
+
+#生成公用covariates
+sigma_comm<-0.1
+  for (j in c(1:4)) {
+    term_phi<-get(paste('comm_phi_', j, sep = ''))
+    term_ar<-list(order=c(1,0,0), ar=term_phi)
+    term_x<-arima.sim(term_ar, n=n, sd=sigma_comm)
+    assign(paste('comm_x_', j, sep = ''), term_x)
+  }
+
+
+#生成相互有相关性的50个平稳covariates时间序列(for each j)
+
+generate_x<-function(j){
+  #均值向量
+mu<-rep(0,50)
+#定义协方差矩阵
+Sigma<-matrix(rep(0,2500), 50, 50)
+for(i1 in c(1:50)){
+  for(i2 in c(1:50)){
+    if(i1==i2){
+      Sigma[i1, i2]=1
+    } else{
+      Sigma[i1, i2]<-sin(1/W[i1, i2]*j)#这里后面循环加j的时候记得乘一下
+    }
+  }
+}
+#tanh(Sigma%*%Sigma/30)
+Sigma_PD<-Sigma%*%Sigma/500
+# for(i in c(1:50)){
+#   Sigma_PD[i,i]=1
+# }
+temp_x<-mvrnorm(n, mu=mu, Sigma=Sigma_PD)
+for(i in c(1:50)){
+  assign(paste('x_',i,'_', j, sep = ''), arima.sim(n=n, list(ar=get(paste('phi_',i,'_', j, sep=''))), innov = temp_x[,i]), envir = .GlobalEnv)
+}
+}
+
+for(j in c(1:8)){
+  generate_x(j)
+}
+
+
+
+
+
+
+#现在开始构建outcome y_{it}=k1*x_i_1+k2*x_i_2+k3*x_i_3+k4*x_i_4+kc1*xc1+kc2*xc2+kc3*xc3+kl1*+y_{i,t-1}+...+epsilon_{it}
+
+for(i in c(1:m)){
+  assign(paste('y',i,sep=''), rep(0,n))
+  assign(paste('real_y',i,sep=''), rep(0,n))
+
+}
+
+
+temp_y<-get(paste('y',i,sep=''))
+temp_y[1]<-0
+assign(paste('y',i,sep=''), temp_y)
+
+
+for(i in c(1:m)){
+  assign(paste('ysl_',i, sep=''), rep(0,n))
+}
+
+#其实可以把beta的生成单独拿出来，然后只生成一次
+
+
+
+#这里t必须在外面
+for(t in c(6:n)){
+  for(i in c(1:m)){
+    temp_beta<-get(paste(state[i], "_coefficient", sep=''))
+    temp_ysl<-get(paste('ysl_',i, sep=''))
+    for(k in c(1:m)){
+      yk<-get(paste('y',k, sep=''))
+      temp_ysl[t-1]<-W[i,k]*yk[t-1]+temp_ysl[t-1]
+    }
+    
+    temp_x1<-get(paste('x_', i, '_1', sep=''))[t]
+    temp_x2<-get(paste('x_', i, '_2', sep=''))[t]
+    temp_x3<-get(paste('x_', i, '_3', sep=''))[t]
+    temp_x4<-get(paste('x_', i, '_4', sep=''))[t]
+    temp_x5<-get(paste('x_', i, '_5', sep=''))[t]
+    temp_x6<-get(paste('x_', i, '_6', sep=''))[t]
+    temp_x7<-get(paste('x_', i, '_7', sep=''))[t]
+    temp_x8<-get(paste('x_', i, '_8', sep=''))[t]
+    
+    temp_error<-rnorm(1,mean = 0, sd=0.01)
+    temp_y<-get(paste('y',i,sep=''))
+    temp_real_y<-get(paste('real_y',i,sep=''))
+    
+    
+
+    temp_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_beta[16]*temp_x5+temp_beta[17]*temp_x6+temp_beta[18]*temp_x7+temp_beta[19]*temp_x8+temp_beta[20]*comm_x_1[t]+temp_beta[21]*comm_x_2[t]+temp_beta[22]*comm_x_3[t]+temp_beta[23]*comm_x_4[t]+temp_error
+
+    temp_real_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_beta[16]*temp_x5+temp_beta[17]*temp_x6+temp_beta[18]*temp_x7+temp_beta[19]*temp_x8+temp_beta[20]*comm_x_1[t]+temp_beta[21]*comm_x_2[t]+temp_beta[22]*comm_x_3[t]+temp_beta[23]*comm_x_4[t]+temp_error
+
+    
+    
+    # temp_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+    #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+    #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])+temp_error
+    # 
+    # temp_real_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+    #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+    #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])
+    
+    
+    assign(paste('y',i, sep=''), temp_y)
+    assign(paste('real_y',i, sep=''), temp_real_y)
+    assign(paste('ysl_',i, sep=''), temp_ysl)
+  }
+}
+
+
+#temp_ysl和temp_y用完之后得赋值还回来
+ts.plot(y1)
+par(mfrow=c(3,3))
+for(i in c(1:m)){
+  temp_series<-get(paste('y', i, sep=''))
+  ts.plot(temp_series)
+}
+
+
+#接下来要把数据整理成一个个表格，然后建模,每个里面有y, x, ysl
+
+for(i in c(1:m)){
+  temp_y<-get(paste('y', i, sep=''))
+  temp_unit<-temp_y
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep=''))))
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=2) )
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=3) )
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=4) )
+  temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=5) )
+  
+  temp_unit<-cbind(temp_unit, get(paste('ysl_', i, sep='')))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep=''))))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=2))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=3))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=4))
+  temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=5))
+  
+  #非公共covariates
+  for(j in c(1:8)){
+    temp_unit<-cbind(temp_unit,get(paste('x_', i, '_', j, sep = '')) )
+  }
+  #公共covariates
+  for(j in c(1:4)){
+    temp_unit<-cbind(temp_unit,get(paste('comm_x_', j, sep = '')))
+  }
+
+  
+  temp_unit<-as.data.frame(temp_unit)
+  names(temp_unit)<-c('y','y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'ysl', 'ysl_lag1', 'ysl_lag2', 'ysl_lag3', 'ysl_lag4', 'ysl_lag5', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'comm_x1', 'comm_x2','comm_x3', 'comm_x4')
+  temp_unit<-temp_unit[c(51:n),]
+  assign(paste('unit_', i, sep=''), temp_unit, envir = .GlobalEnv)
+}
+return(temp_unit)
+}
+
+
+test_return<-simu_func(150, W)
+
+#给Kansas找一个T_0然后加一个causal effect
+T0=100
+
+
+
+sep_series(100)
+#数据生成完了，接下来可以算了应该
+
+
+```
+
+```{r simulation main}
+residual_matrix_simu<-NULL
+for(i in c(1:50)){
+  temp_data<-get(paste('unit_',i, "_pre",sep = ""))
+
+  
+  temp_model<-lm(y~., data=temp_data[,-c( 17:24)])
+  temp_tstep<-step(temp_model)
+  assign(paste('simu_unit', i, '_LST_model', sep=''), temp_tstep)
+  temp_residuals<-temp_tstep$residuals
+  residual_matrix_simu<-cbind(residual_matrix_simu,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  assign(paste(s,"_residual_simu", sep=""),temp_residuals)
+
+}
+
+colnames(residual_matrix_simu)<-state
+
+
+
+SE_LM_simu<-lm(Kansas~. , data = as.data.frame(residual_matrix_simu))
+lm_coef_simu<-coef(SE_LM_simu)[-1]
+alasso_SE_pred_model_simu<-glmnet(x=as.matrix(residual_matrix_simu[,-16]), y=as.matrix(residual_matrix_simu[,16]), alpha=1, penalty.factor = 1/abs(lm_coef_simu))
+
+plot(alasso_SE_pred_model_simu, xvar="lambda")
+
+
+
+alasso_SE_pred_model_simu_cv<-cv.glmnet(x=as.matrix(residual_matrix_simu[,-16]), y=as.matrix(residual_matrix_simu[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef_simu), keep=TRUE)
+
+plot(alasso_SE_pred_model_simu_cv)
+
+best_lambda_simu<-alasso_SE_pred_model_simu_cv$lambda.min
+
+best_alasso_coef_simu<-coef(alasso_SE_pred_model_simu_cv, s=best_lambda_simu)
+
+best_alasso_coef_simu
+#不行现在这个kansas(unit16)的simulation模型根本就不需要x，我得扩大x的影响力
+
+```
+
+```{r 1step prediction result}
+
+#Kansas是第16个unit
+obs_Kansas_post1<-unit_16_post[1,'y']
+#step1: LST预测 Kansas
+sim_LST_pred_Kansas<-predict(simu_unit16_LST_model, unit_16_post[1,])
+
+#计算各地区在T_0+1的误差
+sim_control_residual_post1<-rep(0,50)#还是带了Kansas的位置但是值不给
+names(sim_control_residual_post1)<-state
+for(i in c(1:15, 17:50)){
+  temp_obs_post1<-get(paste('unit_', i, '_post', sep=''))[1,'y']
+  temp_LST_pred1<-predict(get(paste('simu_unit', i, '_LST_model', sep='')), get(paste('unit_', i, '_post', sep=''))[1,])
+  temp_LST_resid1<-temp_obs_post1-temp_LST_pred1
+  assign(paste('unit', i, '_resid_post1', sep=''), temp_LST_resid1)
+  sim_control_residual_post1[i]<-temp_LST_resid1
+}
+#step2: synthetic error
+
+synteitic_kansas_resid1<-predict(alasso_SE_pred_model_simu_cv, s=best_lambda_simu, newx = as.matrix(sim_control_residual_post1)[-16])
+#final result
+sim_pred_se_post1<-sim_LST_pred_Kansas+synteitic_kansas_resid1
+est_error<-obs_Kansas_post1-sim_pred_se_post1
+
+print('obs outcome')
+obs_Kansas_post1
+print('LST outcome')
+sim_LST_pred_Kansas
+print('se_outcome')
+sim_pred_se_post1
+
+```
+
+```{r implement all}
+total_process<-function(seed){
+  set.seed(seed)
+  m=50
+#生成covariates 的ar(1)系数 phi
+for(i in c(1:m)){
+  for(j in c(1:8)){
+    term_phi<-sin(j)*cos(location[i,'longitude']+location[i,'latitude'])/10
+    assign(paste('phi_', i, '_', j, sep = ''), term_phi)
+  }
+}
+
+#生成公共covariates ar系数
+for(i in c(1:4)){
+  temp_comm_phi<-0.5+0.4*sin(i)
+  assign(paste('comm_phi_', i, sep=''), temp_comm_phi)
+}
+
+#提取上述拟合模型中所有拟合系数beta
+#包含的参数有intercept, ysl_lag1,  ysl_lag2,  ysl_lag3,  ysl_lag4,  ysl_lag5, y_lag1, y_lag2, y_lag3, y_lag4, y_lag5, x_1t, x_2t, x_3t, x_4t
+#补充：要加上4个对kansas有显著影响的unobs_covariates，同时这些covariates对于其他的部分地区的outcome有显著影响
+#再次补充：再加上4个common covariates
+#所以目前一共23个变量
+parameter_list<-c('(Intercept)', 'ysl_lag1', 'ysl_lag2',  'ysl_lag3',  'ysl_lag4',  'ysl_lag5', 'y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'totalwagescapita_dif', 'emplvlcapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif')
+temp_beta<-rep(0,23)
+for(i in c(1:50)){
+  temp_s<-state[i]
+  temp_LST_model<-get(paste(temp_s, '_LST_model', sep=''))
+  temp_beta<-rep(0,23)
+  for(j in c(1:13)){
+    temp_param<-parameter_list[j]
+    temp_coef<-as.data.frame(coef(get(paste(temp_s, '_LST_model', sep=''))))
+    if(is.na(temp_coef[temp_param,1])){
+      temp_beta[j]<-0
+    } else{
+      temp_beta[j]<-temp_coef[temp_param,1]
+    }
+  }
+  # for(j in c(16,17)){
+  #   if(i<=30){
+  #     temp_beta[j]<-sin(i*j)
+  #   }
+  # }
+  
+  for(j in c(14:23)){
+        temp_beta[j]<-sin(i*j)*cos(i+j)
+    
+  }
+  assign(paste(temp_s, '_coefficient', sep=''),temp_beta)
+}
+
+
+
+
+simu_func<-function(seed_index, weight_matrix){
+
+#simulation
+set.seed(seed_index)
+#时间点数量
+n=300
+#空间点数量
+m=50
+#创建时间序列time point
+time_points <- seq(from = 1, by = 1, length.out = n)
+W<-weight_matrix
+
+
+
+#生成公用covariates
+sigma_comm<-0.1
+  for (j in c(1:4)) {
+    term_phi<-get(paste('comm_phi_', j, sep = ''))
+    term_ar<-list(order=c(1,0,0), ar=term_phi)
+    term_x<-arima.sim(term_ar, n=n, sd=sigma_comm)
+    assign(paste('comm_x_', j, sep = ''), term_x)
+  }
+
+
+#生成相互有相关性的50个平稳covariates时间序列(for each j)
+
+generate_x<-function(j){
+  #均值向量
+mu<-rep(0,50)
+#定义协方差矩阵
+Sigma<-matrix(rep(0,2500), 50, 50)
+for(i1 in c(1:50)){
+  for(i2 in c(1:50)){
+    if(i1==i2){
+      Sigma[i1, i2]=1
+    } else{
+      Sigma[i1, i2]<-sin(1/W[i1, i2]*j)#这里后面循环加j的时候记得乘一下
+    }
+  }
+}
+#tanh(Sigma%*%Sigma/30)
+Sigma_PD<-Sigma%*%Sigma/500
+# for(i in c(1:50)){
+#   Sigma_PD[i,i]=1
+# }
+temp_x<-mvrnorm(n, mu=mu, Sigma=Sigma_PD)
+for(i in c(1:50)){
+  assign(paste('x_',i,'_', j, sep = ''), arima.sim(n=n, list(ar=get(paste('phi_',i,'_', j, sep=''))), innov = temp_x[,i]), envir = .GlobalEnv)
+}
+}
+
+for(j in c(1:8)){
+  generate_x(j)
+}
+
+
+
+
+
+
+#现在开始构建outcome y_{it}=k1*x_i_1+k2*x_i_2+k3*x_i_3+k4*x_i_4+kc1*xc1+kc2*xc2+kc3*xc3+kl1*+y_{i,t-1}+...+epsilon_{it}
+
+for(i in c(1:m)){
+  assign(paste('y',i,sep=''), rep(0,n))
+  assign(paste('real_y',i,sep=''), rep(0,n))
+
+}
+
+
+temp_y<-get(paste('y',i,sep=''))
+temp_y[1]<-0
+assign(paste('y',i,sep=''), temp_y)
+
+
+for(i in c(1:m)){
+  assign(paste('ysl_',i, sep=''), rep(0,n))
+}
+
+#其实可以把beta的生成单独拿出来，然后只生成一次
+
+
+
+#这里t必须在外面
+for(t in c(6:n)){
+  for(i in c(1:m)){
+    temp_beta<-get(paste(state[i], "_coefficient", sep=''))
+    temp_ysl<-get(paste('ysl_',i, sep=''))
+    for(k in c(1:m)){
+      yk<-get(paste('y',k, sep=''))
+      temp_ysl[t-1]<-W[i,k]*yk[t-1]+temp_ysl[t-1]
+    }
+    
+    temp_x1<-get(paste('x_', i, '_1', sep=''))[t]
+    temp_x2<-get(paste('x_', i, '_2', sep=''))[t]
+    temp_x3<-get(paste('x_', i, '_3', sep=''))[t]
+    temp_x4<-get(paste('x_', i, '_4', sep=''))[t]
+    temp_x5<-get(paste('x_', i, '_5', sep=''))[t]
+    temp_x6<-get(paste('x_', i, '_6', sep=''))[t]
+    temp_x7<-get(paste('x_', i, '_7', sep=''))[t]
+    temp_x8<-get(paste('x_', i, '_8', sep=''))[t]
+    
+    temp_error<-rnorm(1,mean = 0, sd=0.01)
+    temp_y<-get(paste('y',i,sep=''))
+    temp_real_y<-get(paste('real_y',i,sep=''))
+    
+    
+
+    temp_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_beta[16]*temp_x5+temp_beta[17]*temp_x6+temp_beta[18]*temp_x7+temp_beta[19]*temp_x8+temp_beta[20]*comm_x_1[t]+temp_beta[21]*comm_x_2[t]+temp_beta[22]*comm_x_3[t]+temp_beta[23]*comm_x_4[t]+temp_error
+
+    temp_real_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_beta[16]*temp_x5+temp_beta[17]*temp_x6+temp_beta[18]*temp_x7+temp_beta[19]*temp_x8+temp_beta[20]*comm_x_1[t]+temp_beta[21]*comm_x_2[t]+temp_beta[22]*comm_x_3[t]+temp_beta[23]*comm_x_4[t]+temp_error
+
+    
+    
+    # temp_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+    #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+    #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])+temp_error
+    # 
+    # temp_real_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+    #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+    #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])
+    
+    
+    assign(paste('y',i, sep=''), temp_y)
+    assign(paste('real_y',i, sep=''), temp_real_y)
+    assign(paste('ysl_',i, sep=''), temp_ysl)
+  }
+}
+
+
+#temp_ysl和temp_y用完之后得赋值还回来
+ts.plot(y1)
+par(mfrow=c(3,3))
+for(i in c(1:m)){
+  temp_series<-get(paste('y', i, sep=''))
+  ts.plot(temp_series)
+}
+
+
+#接下来要把数据整理成一个个表格，然后建模,每个里面有y, x, ysl
+#另外把所有的unit rbind成一个unit_total
+
+unit_total<-NULL
+
+
+for(i in c(1:m)){
+  temp_y<-get(paste('y', i, sep=''))
+  temp_state<-rep(state[i],300)#新加的
+  temp_time_point<-c(1:300)#新加的
+  temp_fips<-rep(i,300)#新加的
+  temp_unit<-data.frame(temp_time_point, temp_state, temp_y)#新加的
+  temp_unit<-data.frame(temp_unit, lag(get(paste('y', i, sep=''))))
+  temp_unit<-data.frame(temp_unit, lag(get(paste('y', i, sep='')), n=2) )
+  temp_unit<-data.frame(temp_unit, lag(get(paste('y', i, sep='')), n=3) )
+  temp_unit<-data.frame(temp_unit, lag(get(paste('y', i, sep='')), n=4) )
+  temp_unit<-data.frame(temp_unit, lag(get(paste('y', i, sep='')), n=5) )
+  
+  temp_unit<-data.frame(temp_unit, get(paste('ysl_', i, sep='')))
+  temp_unit<-data.frame(temp_unit, lag(get(paste('ysl_', i, sep=''))))
+  temp_unit<-data.frame(temp_unit, lag(get(paste('ysl_', i, sep='')), n=2))
+  temp_unit<-data.frame(temp_unit, lag(get(paste('ysl_', i, sep='')), n=3))
+  temp_unit<-data.frame(temp_unit, lag(get(paste('ysl_', i, sep='')), n=4))
+  temp_unit<-data.frame(temp_unit, lag(get(paste('ysl_', i, sep='')), n=5))
+  
+  #非公共covariates
+  for(j in c(1:8)){
+    temp_unit<-data.frame(temp_unit,get(paste('x_', i, '_', j, sep = '')) )
+  }
+  #公共covariates
+  for(j in c(1:4)){
+    temp_unit<-data.frame(temp_unit,get(paste('comm_x_', j, sep = '')))
+  }
+  
+  temp_unit<-data.frame(temp_unit, temp_fips)#新加的
+
+  
+  temp_unit<-as.data.frame(temp_unit)
+  names(temp_unit)<-c('timepoint', 'state','y','y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'ysl', 'ysl_lag1', 'ysl_lag2', 'ysl_lag3', 'ysl_lag4', 'ysl_lag5', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8', 'comm_x1', 'comm_x2','comm_x3', 'comm_x4', 'fips')
+  temp_unit<-temp_unit[c(51:n),]
+  assign(paste('unit_', i, sep=''), temp_unit, envir = .GlobalEnv)
+  unit_total<-rbind(unit_total,temp_unit)
+}
+return(unit_total)
+}
+
+
+
+unit_total<-simu_func(seed, W)
+
+#给Kansas找一个T_0然后加一个causal effect
+T0=100
+
+
+
+sep_series(100)#这里可以改
+ 
+#数据生成完了，接下来可以算了应该-----------------------------------------------------------------------------
+
+
+
+residual_matrix_simu<-NULL
+for(i in c(1:50)){
+  temp_data<-get(paste('unit_',i, "_pre",sep = ""))
+
+  
+  temp_model<-lm(y~., data=temp_data[,-c(1, 2, 19:27)])
+  temp_tstep<-step(temp_model)
+  assign(paste('simu_unit', i, '_LST_model', sep=''), temp_tstep)
+  temp_residuals<-temp_tstep$residuals
+  residual_matrix_simu<-cbind(residual_matrix_simu,temp_residuals)#先全放在一起
+  #再做一个rbind的符合syntheti格式的dataframe
+  assign(paste(s,"_residual_simu", sep=""),temp_residuals)
+
+}
+
+colnames(residual_matrix_simu)<-state
+
+
+
+SE_LM_simu<-lm(Kansas~. , data = as.data.frame(residual_matrix_simu))
+lm_coef_simu<-coef(SE_LM_simu)[-1]
+alasso_SE_pred_model_simu<-glmnet(x=as.matrix(residual_matrix_simu[,-16]), y=as.matrix(residual_matrix_simu[,16]), alpha=1, penalty.factor = 1/abs(lm_coef_simu))
+
+plot(alasso_SE_pred_model_simu, xvar="lambda")
+
+
+
+alasso_SE_pred_model_simu_cv<-cv.glmnet(x=as.matrix(residual_matrix_simu[,-16]), y=as.matrix(residual_matrix_simu[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef_simu), keep=TRUE)
+
+plot(alasso_SE_pred_model_simu_cv)
+
+best_lambda_simu<-alasso_SE_pred_model_simu_cv$lambda.min
+
+best_alasso_coef_simu<-coef(alasso_SE_pred_model_simu_cv, s=best_lambda_simu)
+
+best_alasso_coef_simu
+
+#prediction
+#Kansas是第16个unit
+obs_Kansas_post1<-unit_16_post[1,'y']
+#step1: LST预测 Kansas
+sim_LST_pred_Kansas<-predict(simu_unit16_LST_model, unit_16_post[1,])
+
+#计算各地区在T_0+1的误差
+sim_control_residual_post1<-rep(0,50)#还是带了Kansas的位置但是值不给
+names(sim_control_residual_post1)<-state
+for(i in c(1:15, 17:50)){
+  temp_obs_post1<-get(paste('unit_', i, '_post', sep=''))[1,'y']
+  temp_LST_pred1<-predict(get(paste('simu_unit', i, '_LST_model', sep='')), get(paste('unit_', i, '_post', sep=''))[1,])
+  temp_LST_resid1<-temp_obs_post1-temp_LST_pred1
+  assign(paste('unit', i, '_resid_post1', sep=''), temp_LST_resid1)
+  sim_control_residual_post1[i]<-temp_LST_resid1
+}
+#step2: synthetic error
+
+synteitic_kansas_resid1<-predict(alasso_SE_pred_model_simu_cv, s=best_lambda_simu, newx = as.matrix(sim_control_residual_post1)[-16])
+#synthetic control
+#-----------正在施工---------------
+dataprep.out<-dataprep(foo = unit_total,
+                       predictors = c('ysl','x1','x2','x3', 'x4' ),
+                       predictors.op = 'mean',
+                       dependent = 'y',
+                       unit.variable = 'fips',
+                       time.variable = 'timepoint',
+                       treatment.identifier=16,
+                       special.predictors = NULL,
+                       controls.identifier = unique(unit_total$fips)[-16],
+                       time.predictors.prior = c(1:100),
+                       time.optimize.ssr = c(1:100),
+                       unit.names.variable = 'state',
+                       time.plot = 1:101
+)
+
+synth.out<-synth(dataprep.out, output=TRUE)
+syn_weights<-synth.out$solution.w
+syn_weights<-syn_weights[,1]
+
+synth_kansas_post<-0
+
+control_states<-state[-16]
+
+for(i in c(1:49)){
+  temp_y<-get(paste(control_states[i],'_pred_data', sep=''))$y
+  synth_kansas_post<-synth_kansas_post+temp_y*syn_weights[i]
+}
+
+
+
+#---------正在施工-----------------
+#final result
+sim_pred_se_post1<-sim_LST_pred_Kansas+synteitic_kansas_resid1
+est_error<-obs_Kansas_post1-sim_pred_se_post1
+LST_error<-obs_Kansas_post1-sim_LST_pred_Kansas
+
+print('obs outcome')
+obs_Kansas_post1
+print('LST outcome')
+sim_LST_pred_Kansas
+print('se_outcome')
+sim_pred_se_post1
+
+result<-rep(0,5)
+result[1]<-obs_Kansas_post1
+result[2]<-sim_LST_pred_Kansas
+result[3]<-sim_pred_se_post1
+result[4]<-est_error
+result[5]<-LST_error
+names(result)<-c('obs', 'LST', 'SE', 'SE_error', 'LST_error')
+return(result)
+}
+
+ #test_result<-total_process(102)
+error_table<-NULL
+total_SE_error<-0
+total_LST_error<-0
+for(seed_num in c(111:130)){
+  temp_errors<-rep(0,2)
+  temp_result<-total_process(seed_num)
+  total_SE_error<-temp_result[4]^2+total_SE_error
+  total_LST_error<-temp_result[5]^2+total_LST_error
+  temp_errors[1]<-temp_result[4]
+  temp_errors[2]<-temp_result[5]
+  error_table<-rbind(temp_errors, error_table)
+}
+names(error_table)<-c('SE_error', 'LST_error')
+print('total_se_error')
+total_SE_error
+print('total_LST_error')
+total_LST_error
+
+```
+
+```{r Multithreading}
+# 设置并行计算的核心数
+cores <- 4  # 你可以根据你的计算机配置调整核心数
+cl <- makeCluster(cores)
+registerDoParallel(cl)
+
+seednum<-101:105
+
+result_table<- foreach(k = seednum, .combine = rbind) %dopar% {
+  library(haven)
+  library(dplyr)
+  library(forecast)
+  library(tseries)
+  library(FinTS)
+  library(Synth)
+  library(gsynth)
+  library(tidyverse)
+  library(glmnet)
+  library(spacetime)
+  library(xts)
+  library(spdep)
+  library(gstat)
+  library(augsynth)
+  
+  library(iterators)
+  library(parallel)
+  library(foreach)
+  library(doParallel)
+  #library(np)
+  library(mgcv)
+  library(MASS)
+  
+  
+  load('20241024_adaptive_synthetic_pred.RData')
+  
+  
+  total_process<-function(seed){
+    m=50
+    #生成covariates 的ar(1)系数 phi
+    for(i in c(1:m)){
+      for(j in c(1:8)){
+        term_phi<-sin(j)*cos(location[i,'longitude']+location[i,'latitude'])/10
+        assign(paste('phi_', i, '_', j, sep = ''), term_phi)
+      }
+    }
+    
+    
+    #提取上述拟合模型中所有拟合系数beta
+    #包含的参数有intercept, ysl_lag1,  ysl_lag2,  ysl_lag3,  ysl_lag4,  ysl_lag5, y_lag1, y_lag2, y_lag3, y_lag4, y_lag5, x_1t, x_2t, x_3t, x_4t
+    #补充：要加上几个对kansas有显著影响的unobs_covariates，同时这些covariates对于其他的部分地区的outcome有显著影响
+    parameter_list<-c('(Intercept)', 'ysl_lag1', 'ysl_lag2',  'ysl_lag3',  'ysl_lag4',  'ysl_lag5', 'y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'totalwagescapita_dif', 'emplvlcapita_dif', 'popestimate_dif', 'qtrly_estabs_count_dif')
+    temp_beta<-rep(0,19)
+    for(i in c(1:50)){
+      temp_s<-state[i]
+      temp_LST_model<-get(paste(temp_s, '_LST_model', sep=''))
+      temp_beta<-rep(0,19)
+      for(j in c(1:15)){
+        temp_param<-parameter_list[j]
+        temp_coef<-as.data.frame(coef(get(paste(temp_s, '_LST_model', sep=''))))
+        if(is.na(temp_coef[temp_param,1])){
+          temp_beta[j]<-0
+        } else{
+          temp_beta[j]<-temp_coef[temp_param,1]
+        }
+      }
+      # for(j in c(16,17)){
+      #   if(i<=30){
+      #     temp_beta[j]<-sin(i*j)
+      #   }
+      # }
+      
+      for(j in c(16:19)){
+        temp_beta[j]<-sin(i*j)*cos(i+j)
+        
+      }
+      assign(paste(temp_s, '_coefficient', sep=''),temp_beta)
+    }
+    
+    
+    
+    
+    simu_func<-function(seed_index, weight_matrix){
+      
+      #simulation
+      set.seed(seed_index)
+      #时间点数量
+      n=300
+      #空间点数量
+      m=50
+      #创建时间序列time point
+      time_points <- seq(from = 1, by = 1, length.out = n)
+      W<-weight_matrix
+      
+      
+      
+      
+      generate_x<-function(j){
+        #均值向量
+        mu<-rep(0,50)
+        #定义协方差矩阵
+        Sigma<-matrix(rep(0,2500), 50, 50)
+        for(i1 in c(1:50)){
+          for(i2 in c(1:50)){
+            if(i1==i2){
+              Sigma[i1, i2]=1
+            } else{
+              Sigma[i1, i2]<-sin(1/W[i1, i2]*j)#这里后面循环加j的时候记得乘一下
+            }
+          }
+        }
+        #tanh(Sigma%*%Sigma/30)
+        Sigma_PD<-Sigma%*%Sigma/500
+        # for(i in c(1:50)){
+        #   Sigma_PD[i,i]=1
+        # }
+        temp_x<-mvrnorm(n, mu=mu, Sigma=Sigma_PD)
+        for(i in c(1:50)){
+          assign(paste('x_',i,'_', j, sep = ''), arima.sim(n=n, list(ar=get(paste('phi_',i,'_', j, sep=''))), innov = temp_x[,i]), envir = .GlobalEnv)
+        }
+      }
+      
+      for(j in c(1:8)){
+        generate_x(j)
+      }
+      
+      
+      
+      
+      
+      
+      #现在开始构建outcome y_{it}=k1*x_i_1+k2*x_i_2+k3*x_i_3+k4*x_i_4+kc1*xc1+kc2*xc2+kc3*xc3+kl1*+y_{i,t-1}+...+epsilon_{it}
+      
+      for(i in c(1:m)){
+        assign(paste('y',i,sep=''), rep(0,n))
+        assign(paste('real_y',i,sep=''), rep(0,n))
+        
+      }
+      
+      
+      temp_y<-get(paste('y',i,sep=''))
+      temp_y[1]<-0
+      assign(paste('y',i,sep=''), temp_y)
+      
+      
+      for(i in c(1:m)){
+        assign(paste('ysl_',i, sep=''), rep(0,n))
+      }
+      
+      #其实可以把beta的生成单独拿出来，然后只生成一次
+      
+      
+      
+      #这里t必须在外面
+      for(t in c(6:n)){
+        for(i in c(1:m)){
+          temp_beta<-get(paste(state[i], "_coefficient", sep=''))
+          temp_ysl<-get(paste('ysl_',i, sep=''))
+          for(k in c(1:m)){
+            yk<-get(paste('y',k, sep=''))
+            temp_ysl[t-1]<-W[i,k]*yk[t-1]+temp_ysl[t-1]
+          }
+          
+          temp_x1<-get(paste('x_', i, '_1', sep=''))[t]
+          temp_x2<-get(paste('x_', i, '_2', sep=''))[t]
+          temp_x3<-get(paste('x_', i, '_3', sep=''))[t]
+          temp_x4<-get(paste('x_', i, '_4', sep=''))[t]
+          temp_x5<-get(paste('x_', i, '_5', sep=''))[t]
+          temp_x6<-get(paste('x_', i, '_6', sep=''))[t]
+          temp_x7<-get(paste('x_', i, '_7', sep=''))[t]
+          temp_x8<-get(paste('x_', i, '_8', sep=''))[t]
+          
+          temp_error<-rnorm(1,mean = 0, sd=0.01)
+          temp_y<-get(paste('y',i,sep=''))
+          temp_real_y<-get(paste('real_y',i,sep=''))
+          
+          
+          
+          temp_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_beta[16]*temp_x5+temp_beta[17]*temp_x6+temp_beta[18]*temp_x7+temp_beta[19]*temp_x8+temp_error
+          
+          temp_real_y[t]<-temp_beta[1]+temp_beta[2]*temp_ysl[t-1]+temp_beta[3]*temp_ysl[t-2]+temp_beta[4]*temp_ysl[t-3]+temp_beta[5]*temp_ysl[t-4]+temp_beta[6]*temp_ysl[t-5]+temp_beta[7]*temp_y[t-1]+temp_beta[8]*temp_y[t-2]+temp_beta[9]*temp_y[t-3]+temp_beta[10]*temp_y[t-4]+temp_beta[11]*temp_y[t-5]+temp_beta[12]*temp_x1+temp_beta[13]*temp_x2+temp_beta[14]*temp_x3+temp_beta[15]*temp_x4+temp_beta[16]*temp_x5+temp_beta[17]*temp_x6+temp_beta[18]*temp_x7+temp_beta[19]*temp_x8+temp_error
+          
+          
+          
+          # temp_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+          #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+          #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])+temp_error
+          # 
+          # temp_real_y[t]<-temp_beta[1]*temp_ysl[t-1]+temp_beta[2]*temp_ysl[t-2]+temp_beta[2]*temp_ysl[t-3]+
+          #   temp_beta[4]*temp_y[t-1]+temp_beta[5]*temp_y[t-2]+temp_beta[6]*temp_y[t-3]+
+          #   log(1+((temp_beta[7]+temp_x1)^2)^temp_beta[8])
+          
+          
+          assign(paste('y',i, sep=''), temp_y)
+          assign(paste('real_y',i, sep=''), temp_real_y)
+          assign(paste('ysl_',i, sep=''), temp_ysl)
+        }
+      }
+      
+      
+      
+      
+      #接下来要把数据整理成一个个表格，然后建模,每个里面有y, x, ysl
+      
+      for(i in c(1:m)){
+        temp_y<-get(paste('y', i, sep=''))
+        temp_unit<-temp_y
+        temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep=''))))
+        temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=2) )
+        temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=3) )
+        temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=4) )
+        temp_unit<-cbind(temp_unit, lag(get(paste('y', i, sep='')), n=5) )
+        
+        temp_unit<-cbind(temp_unit, get(paste('ysl_', i, sep='')))
+        temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep=''))))
+        temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=2))
+        temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=3))
+        temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=4))
+        temp_unit<-cbind(temp_unit, lag(get(paste('ysl_', i, sep='')), n=5))
+        
+        for(j in c(1:8)){
+          temp_unit<-cbind(temp_unit,get(paste('x_', i, '_', j, sep = '')) )
+        }
+        temp_unit<-as.data.frame(temp_unit)
+        names(temp_unit)<-c('y','y_lag1', 'y_lag2', 'y_lag3', 'y_lag4', 'y_lag5', 'ysl', 'ysl_lag1', 'ysl_lag2', 'ysl_lag3', 'ysl_lag4', 'ysl_lag5', 'x1', 'x2', 'x3', 'x4', 'x5', 'x6', 'x7', 'x8')
+        temp_unit<-temp_unit[c(51:n),]
+        assign(paste('unit_', i, sep=''), temp_unit, envir = .GlobalEnv)
+      }
+      return(temp_unit)
+    }
+    
+    
+    test_return<-simu_func(seed, W)
+    
+    #给Kansas找一个T_0然后加一个causal effect
+    T0=100
+    
+    
+    
+    sep_series(100)
+    #数据生成完了，接下来可以算了应该
+    
+    
+    
+    residual_matrix_simu<-NULL
+    for(i in c(1:50)){
+      temp_data<-get(paste('unit_',i, "_pre",sep = ""))
+      
+      
+      temp_model<-lm(y~., data=temp_data[,-c( 15:20)])
+      temp_tstep<-step(temp_model)
+      assign(paste('simu_unit', i, '_LST_model', sep=''), temp_tstep)
+      temp_residuals<-temp_tstep$residuals
+      residual_matrix_simu<-cbind(residual_matrix_simu,temp_residuals)#先全放在一起
+      #再做一个rbind的符合syntheti格式的dataframe
+      assign(paste(s,"_residual_simu", sep=""),temp_residuals)
+      
+    }
+    
+    colnames(residual_matrix_simu)<-state
+    
+    
+    
+    SE_LM_simu<-lm(Kansas~. , data = as.data.frame(residual_matrix_simu))
+    lm_coef_simu<-coef(SE_LM_simu)[-1]
+    alasso_SE_pred_model_simu<-glmnet(x=as.matrix(residual_matrix_simu[,-16]), y=as.matrix(residual_matrix_simu[,16]), alpha=1, penalty.factor = 1/abs(lm_coef_simu))
+    
+    plot(alasso_SE_pred_model_simu, xvar="lambda")
+    
+    
+    
+    alasso_SE_pred_model_simu_cv<-cv.glmnet(x=as.matrix(residual_matrix_simu[,-16]), y=as.matrix(residual_matrix_simu[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef_simu), keep=TRUE)
+    
+    plot(alasso_SE_pred_model_simu_cv)
+    
+    best_lambda_simu<-alasso_SE_pred_model_simu_cv$lambda.min
+    
+    best_alasso_coef_simu<-coef(alasso_SE_pred_model_simu_cv, s=best_lambda_simu)
+    
+    best_alasso_coef_simu
+    
+    #prediction
+    #Kansas是第16个unit
+    obs_Kansas_post1<-unit_16_post[1,'y']
+    #step1: LST预测 Kansas
+    sim_LST_pred_Kansas<-predict(simu_unit16_LST_model, unit_16_post[1,])
+    
+    #计算各地区在T_0+1的误差
+    sim_control_residual_post1<-rep(0,50)#还是带了Kansas的位置但是值不给
+    names(sim_control_residual_post1)<-state
+    for(i in c(1:15, 17:50)){
+      temp_obs_post1<-get(paste('unit_', i, '_post', sep=''))[1,'y']
+      temp_LST_pred1<-predict(get(paste('simu_unit', i, '_LST_model', sep='')), get(paste('unit_', i, '_post', sep=''))[1,])
+      temp_LST_resid1<-temp_obs_post1-temp_LST_pred1
+      assign(paste('unit', i, '_resid_post1', sep=''), temp_LST_resid1)
+      sim_control_residual_post1[i]<-temp_LST_resid1
+    }
+    #step2: synthetic error
+    
+    synteitic_kansas_resid1<-predict(alasso_SE_pred_model_simu_cv, s=best_lambda_simu, newx = as.matrix(sim_control_residual_post1)[-16])
+    #final result
+    sim_pred_se_post1<-sim_LST_pred_Kansas+synteitic_kansas_resid1
+    est_error<-obs_Kansas_post1-sim_pred_se_post1
+    LST_error<-obs_Kansas_post1-sim_LST_pred_Kansas
+    
+    # print('obs outcome')
+    # obs_Kansas_post1
+    # print('LST outcome')
+    # sim_LST_pred_Kansas
+    # print('se_outcome')
+    # sim_pred_se_post1
+    
+    result<-rep(0,5)
+    result[1]<-obs_Kansas_post1
+    result[2]<-sim_LST_pred_Kansas
+    result[3]<-sim_pred_se_post1
+    result[4]<-est_error
+    result[5]<-LST_error
+    names(result)<-c('obs', 'LST', 'SE', 'SE_error', 'LST_error')
+    print(result)
+    return(result)
+  }
+  
+  seed_num<-seednum
+  total_process(k)
+  
+} 
+stopCluster(cl)
+
+```
+
+#------------------------------------------------------------------------ 接下来要循环进行simulation然后看1.预测causal effect的误差
+
+现在这个情况下，lstsem对比lst是有优势的，但是最终效果仍然一般，需要调整模拟数据的复杂程度来让lstsem表现好
+
+重写data gererationg process 可以加几个共同covaraites
+
+
+
+```{r direct skip backup}
+#state_all<-state
+#mean(MF_NC_MSE_table)=1.102247
+#----------------skip_step_multi_step_forward------------------
+#skip_lag_order<-5
+# fit_model_with_lags <- function(data, y_var, y_lag_range, ysl_lag_range) {
+#   # data: 原始数据
+#   # y_var: 因变量列名
+#   # y_lag_range, ysl_lag_range: 各自的 lag 范围，例如 1:5
+#   
+#   df <- data
+#   
+#   # 动态生成 y_lag
+#   for (k in y_lag_range) {
+#     if(k<=5){
+#       next
+#     }else{
+#       df[[paste0("y_lag", k)]] <- dplyr::lag(df[[y_var]], k)
+#     }
+#   }
+#   
+#   # 动态生成 ysl_lag
+#   for (k in ysl_lag_range) {
+#         if(k<=5){
+#       next
+#     }else{
+#     df[[paste0("ysl_lag", k)]] <- dplyr::lag(df[["ysl"]], k)
+#     }
+#   }
+#   
+#   
+#   #browser()
+#   df_clean<-na.omit(df)
+#   #拟合公式字符串
+#   formula_str <- paste(
+#     y_var,
+#     "~",
+#     paste(c(
+#       paste0("y_lag", y_lag_range),
+#       paste0("ysl_lag", ysl_lag_range),
+#       'totalwagescapita_dif',
+#       'emplvlcapita_dif',
+#       'popestimate_dif',
+#       'qtrly_estabs_count_dif'
+#     ), collapse = " + ")
+#   )
+#   
+#   # lm 回归
+# 
+#   model <- lm(as.formula(formula_str), data = df_clean)
+#   model<-step(model)
+#   return(model)
+# }
+# #build model
+# for(s in state){
+#   temp_training_data<-get(paste0(s,'_training_data'))
+#   for(forward_step in c(1:12)){
+#     temp_skip_model<-fit_model_with_lags(temp_training_data, 'y', ((forward_step):(forward_step+skip_lag_order-1)), ((forward_step):(forward_step+skip_lag_order-1)))
+#     assign(paste0(s,'_skip_model_step',forward_step), temp_skip_model)
+#   }
+# }
+# #predict
+# set.seed(150)
+# for(forward_step in c(1:12)){
+#   #linear predict
+#   for(s in state){
+#     #validation data要有足够的lag，可能得用pre_treat_data来弄一下
+#     temp_pre_treat_data<-get(paste0(s, '_pre_treat_data'))
+#     for(j in c(6:(skip_lag_order+forward_step))){
+#       temp_pre_treat_data[,paste0('y_lag', j)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], (j-5))
+#       temp_pre_treat_data[,paste0('ysl_lag', j)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], (j-5))
+#     }
+#     # for(j in c(1:forward_step)){
+#     #   temp_pre_treat_data[,paste0('y_lag', j+skip_lag_order-1)]<-dplyr::lag(temp_pre_treat_data[['y_lag5']], j)
+#     #   temp_pre_treat_data[,paste0('ysl_lag', j+skip_lag_order-1)]<-dplyr::lag(temp_pre_treat_data[['ysl_lag5']], j)
+#     # }
+#     temp_validation_data<-temp_pre_treat_data[72:83,]
+#     assign(paste0(s, '_skip_validation_data_step', forward_step),temp_validation_data)
+#     
+# 
+#     
+#     temp_LM_pred<-predict(get(paste0(s,'_skip_model_step',forward_step)), newdata=temp_validation_data[forward_step,-c(1,2,3,5,8:13) ])
+#     assign(paste0(s,'_step',forward_step, '_LM_pred'), temp_LM_pred)
+#   }
+#   #extract residuals and synthetic residuals
+#   temp_skip_residual_matrix<-NULL
+#   for(s in state){
+#     temp_training_residuals<-get(paste0(s,'_skip_model_step',forward_step))$residuals
+#     temp_skip_residual_matrix<-cbind(temp_skip_residual_matrix,temp_training_residuals)
+#   }
+#   colnames(temp_skip_residual_matrix)<-state
+#   assign(paste0('skip_residual_matrix_step',forward_step), temp_skip_residual_matrix)
+#   #对所有forward_step对应的residual_matrix建立synthetic error model
+#   #由于数据量小，参数大，用lm回归不行，然后我用了ridge之后结果更离谱了
+#   SE_ridge_skip<-glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]), alpha=0)
+#   SE_ridge_skip_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]),type.measure="mse", nfold=10, alpha=0)
+#   best_ridge_lambda<-SE_ridge_skip_cv$lambda.min
+#   lm_coef_skip<-coef(SE_ridge_skip, s=best_ridge_lambda)
+#   lm_coef_skip<-lm_coef_skip[-1,]
+# 
+#   
+#   # SE_LM_skip<-lm(Kansas~. , data = as.data.frame(temp_skip_residual_matrix))
+#   # lm_coef_skip<-coef(SE_LM_skip)[-1]
+#   
+# temp_alasso_skip_SE_model<-glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]), alpha=1, penalty.factor = 1/abs(lm_coef_skip))
+# 
+# temp_alasso_skip_SE_model_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]),type.measure="mse", nfold=10, alpha=1, penalty.factor = 1/abs(lm_coef_skip), keep=TRUE)
+# 
+# temp_alasso_skip_SE_model_cv<-cv.glmnet(x=as.matrix(temp_skip_residual_matrix[,-16]), y=as.matrix(temp_skip_residual_matrix[,16]), type.measure = "mse", nfold=10,alpha=1, penalty.factor = 1/abs(lm_coef_skip), keep=TRUE)
+# 
+# plot(temp_alasso_skip_SE_model_cv)
+# #browser()
+# temp_best_lambda_skip<-temp_alasso_skip_SE_model_cv$lambda.min
+# coef(temp_alasso_skip_SE_model, s=temp_best_lambda_skip)
+# 
+# #计算当前forwardstep的预测误差
+# # for(s in state){
+# #   get(paste0(s,'_step',forward_step, '_LM_pred'))
+# # }
+# #browser()
+# skip_validation_errors<-NULL
+# for(s in state){
+#   temp_validation_data<-get(paste0(s, '_validation_data'))
+#   temp_LM_pred<-get(paste0(s,'_step',forward_step, '_LM_pred'))
+#   temp_error<-temp_validation_data[forward_step,'y']-temp_LM_pred
+#   skip_validation_errors<-cbind(skip_validation_errors, temp_error)
+# }
+# colnames(skip_validation_errors)<-state
+# 
+# 
+# temp_skip_SE_error<-predict(temp_alasso_skip_SE_model_cv, s=temp_best_lambda_skip, newx = skip_validation_errors[,-16])
+# 
+# temp_Kansas_LM_pred<-get(paste0('Kansas_step',forward_step, '_LM_pred'))
+# temp_Kansas_skip_STPSEM_pred<-temp_Kansas_LM_pred+temp_skip_SE_error
+# assign(paste0('Kansas_skip_STPSEM_forwardstep_pred', forward_step), temp_Kansas_skip_STPSEM_pred)
+# }
+# 
+# 
+# Kansas_skip_valid_pred<-rep(0,12)
+# for(i in c(1:12)){
+#   temp_kansas_skip_valid_pred<-print(get(paste0('Kansas_skip_STPSEM_forwardstep_pred', i)))
+#   Kansas_skip_valid_pred[i]<-temp_kansas_skip_valid_pred
+# }
+# MEE_validation_skip_model<-mean((Kansas_validation_data[c(1:12),'y']-Kansas_skip_valid_pred)^2)
+
+```
+
+
+
+
+```{r spatial correlation test}
+W_std<-W
+
+
+for (i in c(1:50)){
+  W_std[i,]<-W[i,]/sum(W[i,])
+}
+
+
+
+y_table_total<-diff_kansas_total_mod[,c('state', 'timepoint', 'y')]
+
+y_table_total<-y_table_total[y_table_total$timepoint<=89,]
+
+W_std>-as.matrix(W_std)
+
+listw_Wstd<-mat2listw(W_std, style = "W")
+
+
+library(spdep)
+library(ggplot2)
+
+
+
+
+times <- sort(unique(y_table_total$timepoint))
+
+moran_results <- data.frame(
+  timepoint = times,
+  moran_I = NA,
+  expectation = NA,
+  variance = NA,
+  statistic = NA,
+  p_value = NA
+)
+
+for (k in seq_along(times)) {
+  
+  tt <- times[k]
+  
+  data_t <- y_table_total[y_table_total$timepoint == tt, ]
+  
+  # 按照 W_std 的州名顺序排列
+  data_t <- data_t[match(colnames(W_std), data_t$state), ]
+  
+  # 检查该时间点是否所有州都齐全
+  if (any(is.na(data_t$state))) {
+    stop(paste("Some states are missing at timepoint", tt))
+  }
+  
+  if (!all(data_t$state == colnames(W_std))) {
+    stop(paste("State order mismatch at timepoint", tt))
+  }
+  
+  test <- moran.test(
+    x = data_t$y,
+    listw = listw_Wstd,
+    zero.policy = TRUE
+  )
+  
+  moran_results$moran_I[k] <- as.numeric(test$estimate["Moran I statistic"])
+  moran_results$expectation[k] <- as.numeric(test$estimate["Expectation"])
+  moran_results$variance[k] <- as.numeric(test$estimate["Variance"])
+  moran_results$statistic[k] <- as.numeric(test$statistic)
+  moran_results$p_value[k] <- test$p.value
+}
+
+moran_results
+
+moran_results$significant_5pct <- moran_results$p_value < 0.05
+moran_results$significant_1pct <- moran_results$p_value < 0.01
+
+moran_results
+
+
+ggplot(moran_results, aes(x = timepoint, y = moran_I)) +
+  geom_line() +
+  geom_point(aes(shape = significant_5pct), size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  theme_bw() +
+  labs(
+    x = "Time point",
+    y = "Moran's I",
+    shape = "p < 0.05",
+    title = "Moran's I Test for Spatial Autocorrelation over Time"
+  )
+
+
+
+
+
+moran_results$significance_label <- ifelse(
+  moran_results$p_value < 0.05,
+  "p < 0.05",
+  "p > 0.05"
+)
+
+moran_results$significance_label <- factor(
+  moran_results$significance_label,
+  levels = c("p > 0.05", "p < 0.05")
+)
+
+ggplot(moran_results, aes(x = timepoint, y = moran_I)) +
+  geom_line() +
+  geom_point(aes(shape = significance_label), size = 2) +
+  geom_hline(yintercept = 0, linetype = "dashed") +
+  scale_shape_manual(
+    values = c("p > 0.05" = 16, "p < 0.05" = 17)
+  ) +
+  theme_bw() +
+  labs(
+    x = "Time point",
+    y = "Moran's I",
+    shape = "",
+    title = "Moran's I Test for Spatial Autocorrelation over Time"
+  )
+
+
+
+
+
+summary_table <- data.frame(
+  total_timepoints = nrow(moran_results),
+  mean_moran_I = mean(moran_results$moran_I, na.rm = TRUE),
+  median_moran_I = median(moran_results$moran_I, na.rm = TRUE),
+  min_moran_I = min(moran_results$moran_I, na.rm = TRUE),
+  max_moran_I = max(moran_results$moran_I, na.rm = TRUE),
+  significant_5pct_count = sum(moran_results$p_value < 0.05, na.rm = TRUE),
+  significant_1pct_count = sum(moran_results$p_value < 0.01, na.rm = TRUE)
+)
+
+summary_table
+
+```
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+

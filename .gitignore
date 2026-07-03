@@ -1,0 +1,8 @@
+.Rproj.user
+.Rhistory
+.RData
+.Ruserdata
+results/*.rds
+results/*.RData
+results/*.html
+results/*.pdf

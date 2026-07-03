@@ -1,0 +1,10 @@
+Package: PSTSEMProject
+Type: Project
+Title: Vary-Coefficient Spatial Temporal Synthetic Error Model Project
+Version: 0.1.0
+Authors@R: person("Yan", role = c("aut", "cre"))
+Description: Refactored project structure for the original R Markdown workflow,
+    including empirical PSTSEM experiments, synthetic-control baselines,
+    simulations, plotting, and spatial correlation diagnostics.
+Depends: R (>= 4.2.0)
+Encoding: UTF-8

@@ -1,0 +1,35 @@
+# Source chunk: library
+# Original Rmd lines: 32-65
+
+library(haven)
+library(dplyr)
+library(forecast)
+library(tseries)
+library(FinTS)
+library(Synth)
+library(gsynth)
+library(tidyverse)
+library(glmnet)
+library(spacetime)
+library(xts)
+library(spdep)
+library(ggplot2)
+library(augsynth)
+library(naniar)
+#安装augsynth的时候不能直接Install.packages， 要使用devtools从github安装，并且需要r版本对应的rtools
+
+library(gstat)
+library(iterators)
+library(parallel)
+library(foreach)
+library(doParallel)
+#library(np)
+library(mgcv)
+library(MASS)
+library(varycoef)
+library(patchwork)
+library(Rcpp)
+library(gsynth)
+
+# Disabled in project scripts: install.packages("spdep")
+library(spdep)
